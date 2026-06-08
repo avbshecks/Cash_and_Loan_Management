@@ -1,0 +1,59 @@
+# ─── Build output ─────────────────────────────────────────────
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+build/
+bld/
+[Ll]og/
+[Ll]ogs/
+
+# ─── .NET ─────────────────────────────────────────────────────
+project.lock.json
+project.fragment.lock.json
+artifacts/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.cache
+*.dll
+*.pdb
+
+# ─── Rider / VS / VS Code ─────────────────────────────────────
+.vs/
+.vscode/
+.idea/
+*.DotSettings.user
+
+# ─── Test results ─────────────────────────────────────────────
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.trx
+*.coverage
+*.coveragexml
+
+# ─── NuGet ────────────────────────────────────────────────────
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+!packages/build/
+
+# ─── App runtime / secrets ────────────────────────────────────
+appsettings.Development.json
+appsettings.Local.json
+*.env
+.env
+secrets.json
+
+# ─── OS ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Local agent / editor config ──────────────────────────────
+.claude/
