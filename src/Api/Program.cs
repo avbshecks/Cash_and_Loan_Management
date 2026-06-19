@@ -20,6 +20,11 @@ AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true);
 
 var builder = WebApplication.CreateBuilder(args);
 
+// ─── Hosting port (Render/containers inject PORT) ─────────────────────────────
+var port = Environment.GetEnvironmentVariable("PORT");
+if (!string.IsNullOrWhiteSpace(port))
+    builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+
 // ─── Serilog ─────────────────────────────────────────────────────────────────
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)
@@ -28,10 +33,17 @@ Log.Logger = new LoggerConfiguration()
 builder.Host.UseSerilog();
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
+// Always allow localhost (dev); add deployed frontend origin(s) via the
+// Cors__AllowedOrigins env var (comma-separated), e.g. https://calm-fe.vercel.app
+var corsOrigins = new List<string> { "http://localhost:3000", "https://localhost:3000" };
+var configuredOrigins = builder.Configuration["Cors:AllowedOrigins"];
+if (!string.IsNullOrWhiteSpace(configuredOrigins))
+    corsOrigins.AddRange(configuredOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("Frontend", policy =>
-        policy.WithOrigins("http://localhost:3000", "https://localhost:3000")
+        policy.WithOrigins(corsOrigins.ToArray())
               .AllowAnyHeader()
               .AllowAnyMethod());
 });
@@ -81,7 +93,12 @@ var connectionString = builder.Configuration.GetConnectionString("DefaultConnect
 builder.Services.AddDbContext<CashLoanDbContext>(options =>
     options.UseNpgsql(
         connectionString,
-        b => b.MigrationsAssembly(typeof(CashLoanDbContext).Assembly.FullName)));
+        b =>
+        {
+            b.MigrationsAssembly(typeof(CashLoanDbContext).Assembly.FullName);
+            // Resilience for serverless Postgres (e.g. Neon) cold starts
+            b.EnableRetryOnFailure(maxRetryCount: 5, maxRetryDelay: TimeSpan.FromSeconds(10), errorCodesToAdd: null);
+        }));
 
 builder.Services.AddScoped<ICashLoanDbContext>(p => p.GetRequiredService<CashLoanDbContext>());
 
@@ -148,27 +165,25 @@ app.UseCors("Frontend");
 
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 
-if (app.Environment.IsDevelopment())
+// Swagger available in all environments (handy for UAT API exploration)
+app.UseSwagger();
+app.UseSwaggerUI(c =>
 {
-    app.UseSwagger();
-    app.UseSwaggerUI(c =>
-    {
-        c.SwaggerEndpoint("/swagger/v1/swagger.json", "Cash & Loan Management API v1");
-        c.RoutePrefix = string.Empty;
-    });
-}
+    c.SwaggerEndpoint("/swagger/v1/swagger.json", "Cash & Loan Management API v1");
+    c.RoutePrefix = "swagger";   // served at /swagger (root is reserved for /health)
+});
 
 app.UseSerilogRequestLogging();
 
-// Only redirect to HTTPS in production — in dev the browser calls http://localhost:5012
-// and a 307 redirect kills CORS preflight before headers are written.
-if (!app.Environment.IsDevelopment())
-{
-    app.UseHttpsRedirection();
-}
+// NOTE: No UseHttpsRedirection — the platform (Render/Vercel) terminates TLS at
+// the proxy and forwards plain HTTP to the container; redirecting here causes loops.
 
 app.UseAuthentication();
 app.UseAuthorization();
+
+// ─── Health check (used by host platform & uptime pings) ──────────────────────
+app.MapGet("/health", () => Results.Ok(new { status = "healthy", utc = DateTime.UtcNow }))
+   .AllowAnonymous();
 
 // ─── Hangfire Dashboard (restrict to localhost / admin in prod) ───────────────
 app.UseHangfireDashboard("/hangfire", new DashboardOptions

@@ -1,0 +1,12 @@
+**/bin/
+**/obj/
+**/Logs/
+**/out/
+.git/
+.vs/
+.vscode/
+.idea/
+.claude/
+*.user
+*.md
+docker-compose*.yml

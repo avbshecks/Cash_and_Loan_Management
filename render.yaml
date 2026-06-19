@@ -1,0 +1,20 @@
+# Render blueprint for the CALM API (free tier).
+# Database is hosted separately on Neon (free) — its URL goes in
+# ConnectionStrings__DefaultConnection below (set as a secret in the dashboard).
+services:
+  - type: web
+    name: calm-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      # Secrets — set these in the Render dashboard (sync:false keeps them out of git)
+      - key: ConnectionStrings__DefaultConnection
+        sync: false
+      - key: JwtSettings__Secret
+        sync: false
+      - key: Cors__AllowedOrigins
+        sync: false
