@@ -5,6 +5,7 @@ using CashLoanManagement.Application.Common.Interfaces;
 using CashLoanManagement.Application.DTOs.Loan;
 using CashLoanManagement.Domain.Entities;
 using CashLoanManagement.Domain.Enums;
+using CashLoanManagement.Infrastructure.Jobs;
 using CashLoanManagement.Infrastructure.Persistence;
 
 namespace CashLoanManagement.Api.Controllers;
@@ -441,6 +442,37 @@ public class LoanController : BaseApiController
             loanStatus    = newRemaining <= 0 ? "Paid" : loan.Status.ToString(),
             totalRepaid   = totalRepaid + request.Amount,
             repaymentProgress = Math.Round(((totalRepaid + request.Amount) / loan.Amount) * 100, 1)
+        });
+    }
+
+    // ─── MANUAL OVERDUE / BLACKLIST CHECK ─────────────────────────────────────
+    /// <summary>
+    /// Runs the overdue-marking and auto-blacklist evaluations on demand
+    /// (same logic as the scheduled daily jobs). Useful for UAT.
+    /// </summary>
+    [HttpPost("run-overdue-check")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> RunOverdueCheck([FromServices] LoanStatusJob job)
+    {
+        var overdueBefore     = await _context.Loans.CountAsync(l => l.Status == LoanStatus.Overdue);
+        var blacklistedBefore = await _context.Borrowers.CountAsync(b => b.IsBlacklisted);
+
+        await job.MarkOverdueLoansAsync();
+        await job.AutoBlacklistDefaultersAsync();
+
+        var overdueAfter     = await _context.Loans.CountAsync(l => l.Status == LoanStatus.Overdue);
+        var blacklistedAfter = await _context.Borrowers.CountAsync(b => b.IsBlacklisted);
+
+        await LogAuditAsync(GetCurrentUserId(),
+            $"Manual overdue/blacklist check run. Overdue {overdueBefore}->{overdueAfter}, blacklisted {blacklistedBefore}->{blacklistedAfter}.");
+
+        return Ok(new
+        {
+            message               = "Overdue check completed.",
+            newlyOverdue          = overdueAfter  - overdueBefore,
+            newlyBlacklisted      = blacklistedAfter - blacklistedBefore,
+            totalOverdue          = overdueAfter,
+            totalBlacklisted      = blacklistedAfter
         });
     }
 

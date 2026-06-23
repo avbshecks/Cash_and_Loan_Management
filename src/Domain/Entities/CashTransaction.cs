@@ -16,6 +16,10 @@ public class CashTransaction : BaseEntity
     public string? RejectionReason { get; set; }
     public DateTime? ApprovedAt { get; set; }
 
+    // Reversal (corrections): a contra entry that nets a mistaken entry to zero.
+    public bool IsReversed { get; set; }                  // true on the ORIGINAL once reversed
+    public int? ReversalOfTransactionId { get; set; }     // set on the REVERSAL entry, points to original
+
     // Foreign Keys
     public int CreatedByUserId { get; set; }
     public int? ApprovedByUserId { get; set; }

@@ -29,39 +29,42 @@ public class CashController : BaseApiController
         var balance = await ComputeBalanceAsync();
         var pendingCount = await _context.CashTransactions
             .CountAsync(t => t.Type == TransactionType.Disbursement && t.ApprovalStatus == CashApprovalStatus.Pending);
-        return Ok(new { currentBalance = balance, currency = "USD", pendingDisbursements = pendingCount });
+        var initialized = await _context.CashTransactions.AnyAsync();
+        return Ok(new { currentBalance = balance, currency = "USD", pendingDisbursements = pendingCount, initialized });
     }
 
-    // ─── POST /api/cash/opening-balance ──────────────────────────────────────
+    // ─── POST /api/cash/opening-balance (ONE-TIME initial setup only) ─────────
+    /// <summary>
+    /// Captures the system's very first opening balance (initial cash at inception).
+    /// Allowed only when no cash transactions exist yet. From then on each day's
+    /// opening balance is automatically the previous day's closing balance — there
+    /// is no daily manual capture.
+    /// </summary>
     [HttpPost("opening-balance")]
-    public async Task<IActionResult> SetOpeningBalance([FromBody] SetOpeningBalanceDto request)
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> SetInitialOpeningBalance([FromBody] SetOpeningBalanceDto request)
     {
         if (request.Amount < 0)
             return BadRequest(new { message = "Opening balance cannot be negative." });
 
-        var todayUtc    = DateTime.SpecifyKind(DateTime.UtcNow.Date, DateTimeKind.Utc);
-        var tomorrowUtc = todayUtc.AddDays(1);
-
-        var alreadySet = await _context.CashTransactions
-            .AnyAsync(t => t.Type == TransactionType.OpeningBalance && t.Date >= todayUtc && t.Date < tomorrowUtc);
-
-        if (alreadySet)
-            return BadRequest(new { message = "Opening balance has already been set for today." });
+        var anyExisting = await _context.CashTransactions.AnyAsync();
+        if (anyExisting)
+            return BadRequest(new { message = "Initial opening balance can only be set once. Each day's opening balance now carries forward automatically from the previous day's closing balance." });
 
         var userId = GetCurrentUserId();
         _context.CashTransactions.Add(new CashTransaction
         {
             Amount = request.Amount, Type = TransactionType.OpeningBalance,
-            SourceOrPurpose = "Daily Opening Balance",
-            Reference = $"OB-{todayUtc:yyyyMMdd}",
+            SourceOrPurpose = "Initial Opening Balance",
+            Reference = $"OB-INIT-{DateTime.UtcNow:yyyyMMdd}",
             Date = DateTime.UtcNow, ApprovalStatus = CashApprovalStatus.AutoApproved,
             ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
             CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
         });
-        await LogAuditAsync(userId, $"Opening balance set: ${request.Amount:N2}{(request.Notes != null ? " — " + request.Notes : "")}");
+        await LogAuditAsync(userId, $"Initial opening balance set: ${request.Amount:N2}{(request.Notes != null ? " — " + request.Notes : "")}");
         await _context.SaveChangesAsync();
 
-        return Ok(new { message = "Opening balance recorded.", openingBalance = request.Amount });
+        return Ok(new { message = "Initial opening balance recorded.", openingBalance = request.Amount });
     }
 
     // ─── POST /api/cash/add ───────────────────────────────────────────────────
@@ -241,6 +244,8 @@ public class CashController : BaseApiController
                 status     = t.ApprovalStatus.ToString(),
                 t.SourceOrPurpose, t.Reference,
                 t.RejectionReason,
+                t.IsReversed,
+                isReversal = t.ReversalOfTransactionId != null,
                 createdBy  = t.CreatedByUser.FullName,
                 approvedBy = t.ApprovedByUser != null ? t.ApprovedByUser.FullName : null,
                 t.ApprovedAt
@@ -250,30 +255,101 @@ public class CashController : BaseApiController
         return Ok(new { total, page, pageSize, transactions = txns });
     }
 
+    // ─── POST /api/cash/reverse/{id} ──────────────────────────────────────────
+    /// <summary>
+    /// Reverses a posted cash transaction by creating an equal, opposite-signed
+    /// contra entry of the same type (e.g. an entry of 1000 entered by mistake is
+    /// netted to zero). The original is preserved and flagged reversed; the user
+    /// then re-posts the correct amount normally. Admin/Manager only.
+    /// </summary>
+    [HttpPost("reverse/{id:int}")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> ReverseTransaction(int id, [FromBody] string reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return BadRequest(new { message = "A reason for the reversal is required." });
+
+        var original = await _context.CashTransactions.FirstOrDefaultAsync(t => t.Id == id);
+        if (original == null) return NotFound(new { message = "Transaction not found." });
+
+        if (original.ReversalOfTransactionId != null)
+            return BadRequest(new { message = "You cannot reverse a reversal entry." });
+        if (original.IsReversed)
+            return BadRequest(new { message = "This transaction has already been reversed." });
+
+        // Only posted (counted) entries can be reversed. Pending disbursements should
+        // be rejected via /cash/reject instead.
+        var isCounted = original.ApprovalStatus == CashApprovalStatus.AutoApproved
+                     || original.ApprovalStatus == CashApprovalStatus.Approved;
+        if (!isCounted)
+            return BadRequest(new { message = $"Only posted transactions can be reversed (this one is {original.ApprovalStatus}). Reject pending disbursements instead." });
+
+        var userId = GetCurrentUserId();
+
+        // Contra entry: same type, negative amount, auto-approved — nets the original to zero.
+        var reversal = new CashTransaction
+        {
+            Amount          = -original.Amount,
+            Type            = original.Type,
+            SourceOrPurpose = $"Reversal of {original.Reference}: {reason}",
+            Reference       = $"REV-{original.Reference}",
+            Date            = DateTime.UtcNow,
+            ApprovalStatus  = CashApprovalStatus.Approved,
+            ReversalOfTransactionId = original.Id,
+            ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
+            CreatedByUserId  = userId, CreatedAt = DateTime.UtcNow
+        };
+        _context.CashTransactions.Add(reversal);
+
+        original.IsReversed = true;
+        original.UpdatedAt  = DateTime.UtcNow;
+
+        await LogAuditAsync(userId, $"Reversed transaction {original.Reference} (${original.Amount:N2} {original.Type}). Reason: {reason}");
+        await _context.SaveChangesAsync();
+
+        return Ok(new
+        {
+            message       = $"Transaction {original.Reference} reversed. You can now post the correct amount.",
+            reversalReference = reversal.Reference,
+            newBalance    = await ComputeBalanceAsync()
+        });
+    }
+
+    // ─── GET /api/cash/opening-balance/today ──────────────────────────────────
+    /// <summary>Today's opening balance = closing balance of all prior days (auto carry-forward).</summary>
+    [HttpGet("opening-balance/today")]
+    public async Task<IActionResult> GetTodayOpeningBalance()
+    {
+        var todayUtc = DateTime.SpecifyKind(DateTime.UtcNow.Date, DateTimeKind.Utc);
+        return Ok(new { openingBalance = await ComputeBalanceBeforeAsync(todayUtc) });
+    }
+
     // ─── POST /api/cash/reconcile ─────────────────────────────────────────────
     [HttpPost("reconcile")]
     public async Task<IActionResult> Reconcile([FromBody] ReconcileCashDto request)
     {
-        var userId          = GetCurrentUserId();
+        var userId            = GetCurrentUserId();
+        var todayUtc          = DateTime.SpecifyKind(DateTime.UtcNow.Date, DateTimeKind.Utc);
+        var openingBalance    = await ComputeBalanceBeforeAsync(todayUtc);   // auto carry-forward
         var calculatedBalance = await ComputeBalanceAsync();
         var variance          = request.ActualEndBalance - calculatedBalance;
 
         _context.CashReconciliations.Add(new CashReconciliation
         {
-            Date = DateTime.UtcNow.Date, OpeningBalance = request.OpeningBalance,
+            Date = DateTime.UtcNow.Date, OpeningBalance = openingBalance,
             CalculatedEndBalance = calculatedBalance, ActualEndBalance = request.ActualEndBalance,
             Variance = variance, Comment = request.Comment,
             ReconciliationUserId = userId, CreatedAt = DateTime.UtcNow
         });
 
-        await LogAuditAsync(userId, $"Reconciliation: Calculated ${calculatedBalance:N2}, Actual ${request.ActualEndBalance:N2}, Variance ${variance:N2}.");
+        await LogAuditAsync(userId, $"Reconciliation: Opening ${openingBalance:N2}, Calculated ${calculatedBalance:N2}, Actual ${request.ActualEndBalance:N2}, Variance ${variance:N2}.");
         await _context.SaveChangesAsync();
 
         if (variance != 0)
             await _notificationService.NotifyRoleAsync("Manager", "Reconciliation Variance",
                 $"Variance of ${variance:N2} on {DateTime.UtcNow:yyyy-MM-dd}.", NotificationType.ReconciliationVariance);
 
-        return Ok(new { message = "Reconciliation saved.", calculatedBalance, actualBalance = request.ActualEndBalance, variance, status = variance == 0 ? "Balanced" : "Variance Flagged" });
+        return Ok(new { message = "Reconciliation saved.", openingBalance, calculatedBalance, actualBalance = request.ActualEndBalance, variance, status = variance == 0 ? "Balanced" : "Variance Flagged" });
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -286,6 +362,23 @@ public class CashController : BaseApiController
         // Only count APPROVED disbursements (AutoApproved for legacy, Approved for new)
         var debits = await _context.CashTransactions
             .Where(t => t.Type == TransactionType.Disbursement &&
+                       (t.ApprovalStatus == CashApprovalStatus.AutoApproved ||
+                        t.ApprovalStatus == CashApprovalStatus.Approved))
+            .SumAsync(t => (decimal?)t.Amount) ?? 0m;
+
+        return credits - debits;
+    }
+
+    /// <summary>Running balance of all posted transactions strictly before the given UTC instant.</summary>
+    private async Task<decimal> ComputeBalanceBeforeAsync(DateTime beforeUtc)
+    {
+        var credits = await _context.CashTransactions
+            .Where(t => (t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition)
+                        && t.Date < beforeUtc)
+            .SumAsync(t => (decimal?)t.Amount) ?? 0m;
+
+        var debits = await _context.CashTransactions
+            .Where(t => t.Type == TransactionType.Disbursement && t.Date < beforeUtc &&
                        (t.ApprovalStatus == CashApprovalStatus.AutoApproved ||
                         t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
