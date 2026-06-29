@@ -3,6 +3,7 @@ using System;
 using CashLoanManagement.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace CashLoanManagement.Infrastructure.Migrations
 {
     [DbContext(typeof(CashLoanDbContext))]
-    partial class CashLoanDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260629121617_AddDayLoanAndSafekeeping")]
+    partial class AddDayLoanAndSafekeeping
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -469,35 +472,35 @@ namespace CashLoanManagement.Infrastructure.Migrations
                         new
                         {
                             Id = 1,
-                            CreatedAt = new DateTime(2026, 6, 29, 12, 40, 13, 841, DateTimeKind.Utc).AddTicks(824),
+                            CreatedAt = new DateTime(2026, 6, 29, 12, 16, 16, 971, DateTimeKind.Utc).AddTicks(1545),
                             Description = "Full system access",
                             Name = "Admin"
                         },
                         new
                         {
                             Id = 2,
-                            CreatedAt = new DateTime(2026, 6, 29, 12, 40, 13, 841, DateTimeKind.Utc).AddTicks(829),
+                            CreatedAt = new DateTime(2026, 6, 29, 12, 16, 16, 971, DateTimeKind.Utc).AddTicks(1553),
                             Description = "Cash transactions access",
                             Name = "Cashier"
                         },
                         new
                         {
                             Id = 3,
-                            CreatedAt = new DateTime(2026, 6, 29, 12, 40, 13, 841, DateTimeKind.Utc).AddTicks(830),
+                            CreatedAt = new DateTime(2026, 6, 29, 12, 16, 16, 971, DateTimeKind.Utc).AddTicks(1555),
                             Description = "Loans and approvals access",
                             Name = "Finance Officer"
                         },
                         new
                         {
                             Id = 4,
-                            CreatedAt = new DateTime(2026, 6, 29, 12, 40, 13, 841, DateTimeKind.Utc).AddTicks(831),
+                            CreatedAt = new DateTime(2026, 6, 29, 12, 16, 16, 971, DateTimeKind.Utc).AddTicks(1557),
                             Description = "Reporting and approvals access",
                             Name = "Manager"
                         },
                         new
                         {
                             Id = 5,
-                            CreatedAt = new DateTime(2026, 6, 29, 12, 40, 13, 841, DateTimeKind.Utc).AddTicks(832),
+                            CreatedAt = new DateTime(2026, 6, 29, 12, 16, 16, 971, DateTimeKind.Utc).AddTicks(1559),
                             Description = "Read-only reporting access",
                             Name = "Auditor"
                         });
@@ -558,15 +561,6 @@ namespace CashLoanManagement.Infrastructure.Migrations
                     b.Property<decimal>("Amount")
                         .HasColumnType("decimal(18,2)");
 
-                    b.Property<int>("ApprovalStatus")
-                        .HasColumnType("integer");
-
-                    b.Property<DateTime?>("ApprovedAt")
-                        .HasColumnType("timestamp without time zone");
-
-                    b.Property<int?>("ApprovedByUserId")
-                        .HasColumnType("integer");
-
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("timestamp without time zone");
 
@@ -581,9 +575,6 @@ namespace CashLoanManagement.Infrastructure.Migrations
 
                     b.Property<string>("Reference")
                         .IsRequired()
-                        .HasColumnType("text");
-
-                    b.Property<string>("RejectionReason")
                         .HasColumnType("text");
 
                     b.Property<int>("Type")

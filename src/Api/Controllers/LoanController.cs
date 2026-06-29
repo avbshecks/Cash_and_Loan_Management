@@ -209,6 +209,72 @@ public class LoanController : BaseApiController
         });
     }
 
+    // ─── DAY LOAN: borrow in the morning, repay in the evening ────────────────
+    /// <summary>
+    /// Creates a same-day loan that is immediately active and disbursed (one step),
+    /// due by end of today. Repaid in the evening via the normal repayment flow.
+    /// </summary>
+    [HttpPost("day-loan")]
+    [Authorize(Roles = "Admin,Manager,Finance Officer,Cashier")]
+    public async Task<IActionResult> CreateDayLoan([FromBody] CreateDayLoanDto request)
+    {
+        var borrower = await _context.Borrowers.FindAsync(request.BorrowerId);
+        if (borrower == null) return NotFound(new { message = "Borrower not found." });
+        if (borrower.IsBlacklisted)
+            return BadRequest(new { message = $"'{borrower.FullName}' is blacklisted and cannot receive a loan." });
+        if (request.Amount <= 0)
+            return BadRequest(new { message = "Amount must be greater than zero." });
+
+        var hasOpenLoan = await _context.Loans.AnyAsync(l =>
+            l.BorrowerId == request.BorrowerId &&
+            (l.Status == LoanStatus.Active || l.Status == LoanStatus.Approved ||
+             l.Status == LoanStatus.Pending || l.Status == LoanStatus.Overdue));
+        if (hasOpenLoan)
+            return BadRequest(new { message = "Borrower already has an open loan." });
+
+        var balance = await _cashHelper.ComputeBalanceAsync();
+        if (request.Amount > balance)
+            return BadRequest(new { message = $"Insufficient cash. Available: ${balance:N2}, Required: ${request.Amount:N2}." });
+
+        var userId    = GetCurrentUserId();
+        var reference = $"DL-{DateTime.UtcNow:yyyyMMdd}-{Guid.NewGuid().ToString("N")[..6].ToUpper()}";
+        // Due end of today (UTC)
+        var dueToday  = DateTime.SpecifyKind(DateTime.UtcNow.Date.AddDays(1).AddSeconds(-1), DateTimeKind.Utc);
+
+        var loan = new Loan
+        {
+            ReferenceNumber = reference, BorrowerId = request.BorrowerId,
+            Amount = request.Amount, Type = LoanType.DayLoan,
+            RepaymentTerms = "Same-day — borrow in the morning, repay by evening.",
+            DueDate = dueToday, Status = LoanStatus.Active,
+            CreatedByUserId = userId, ApprovedByUserId = userId,
+            ApprovedAt = DateTime.UtcNow, DisbursedAt = DateTime.UtcNow,
+            CreatedAt = DateTime.UtcNow
+        };
+        _context.Loans.Add(loan);
+
+        // Immediate cash disbursement (approved)
+        _context.CashTransactions.Add(new CashTransaction
+        {
+            Amount = request.Amount, Type = TransactionType.Disbursement,
+            SourceOrPurpose = $"Day loan — {borrower.FullName} ({reference})" + (request.Notes != null ? $" — {request.Notes}" : ""),
+            Reference = reference, Date = DateTime.UtcNow,
+            ApprovalStatus = CashApprovalStatus.Approved,
+            ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
+            CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
+        });
+
+        await LogAuditAsync(userId, $"Day loan issued: {reference} ${request.Amount:N2} to {borrower.FullName}. Due today.");
+        await _context.SaveChangesAsync();
+
+        return Ok(new
+        {
+            message = $"Day loan {reference} issued and disbursed. Due by end of today.",
+            loanId = loan.Id, referenceNumber = reference,
+            dueDate = dueToday, newCashBalance = await _cashHelper.ComputeBalanceAsync()
+        });
+    }
+
     [HttpPost("create")]
     public async Task<IActionResult> CreateLoan([FromBody] CreateLoanDto request)
     {

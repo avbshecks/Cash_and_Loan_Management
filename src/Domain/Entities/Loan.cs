@@ -11,6 +11,7 @@ public class Loan : BaseEntity
     public string RepaymentTerms { get; set; } = string.Empty;
     public DateTime DueDate { get; set; }
     public LoanStatus Status { get; set; } = LoanStatus.Pending;
+    public LoanType Type { get; set; } = LoanType.Standard;
 
     // Foreign Keys
     public int BorrowerId { get; set; }

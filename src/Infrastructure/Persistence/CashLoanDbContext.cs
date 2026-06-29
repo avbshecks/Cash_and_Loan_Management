@@ -24,6 +24,8 @@ public class CashLoanDbContext : DbContext, ICashLoanDbContext
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
     public DbSet<Notification> Notifications => Set<Notification>();
     public DbSet<ApprovalWorkflow> ApprovalWorkflows => Set<ApprovalWorkflow>();
+    public DbSet<SafekeepingAccount> SafekeepingAccounts => Set<SafekeepingAccount>();
+    public DbSet<SafekeepingTransaction> SafekeepingTransactions => Set<SafekeepingTransaction>();
 
     public override Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
     {
@@ -57,6 +59,29 @@ public class CashLoanDbContext : DbContext, ICashLoanDbContext
         modelBuilder.Entity<LoanRepayment>()
             .Property(r => r.Amount)
             .HasColumnType("decimal(18,2)");
+
+        modelBuilder.Entity<SafekeepingTransaction>()
+            .Property(t => t.Amount)
+            .HasColumnType("decimal(18,2)");
+
+        // Safekeeping relationships
+        modelBuilder.Entity<SafekeepingAccount>()
+            .HasOne(a => a.CreatedByUser)
+            .WithMany()
+            .HasForeignKey(a => a.CreatedByUserId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        modelBuilder.Entity<SafekeepingTransaction>()
+            .HasOne(t => t.Account)
+            .WithMany(a => a.Transactions)
+            .HasForeignKey(t => t.AccountId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<SafekeepingTransaction>()
+            .HasOne(t => t.CreatedByUser)
+            .WithMany()
+            .HasForeignKey(t => t.CreatedByUserId)
+            .OnDelete(DeleteBehavior.Restrict);
 
         // Restrict deletes on multiple cascade paths
         modelBuilder.Entity<Loan>()
