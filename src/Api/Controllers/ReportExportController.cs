@@ -64,7 +64,19 @@ public class ReportExportController : ControllerBase
         if (format.ToLower() == "pdf")
             return PdfDailyCash(title, fileName, dayStart, transactions, openingBalance, adds, disb, closing, reconciliation);
 
-        return ExcelDailyCash(title, fileName, dayStart, transactions, openingBalance, adds, disb, closing, reconciliation);
+        // Excel in DR/CR ledger format (shared builder)
+        var rows = transactions
+            // Exclude pending/rejected disbursements from the posted ledger
+            .Where(t => t.Type != TransactionType.Disbursement ||
+                        t.ApprovalStatus == CashApprovalStatus.AutoApproved ||
+                        t.ApprovalStatus == CashApprovalStatus.Approved)
+            .Select(t => (
+                Time: t.Date, Type: t.Type, Amount: t.Amount,
+                Source: t.SourceOrPurpose, Reference: t.Reference,
+                By: t.CreatedByUser?.FullName ?? "")).ToList();
+
+        var ms = DrCrExcel.Build(title, openingBalance, adds, disb, closing, rows);
+        return File(ms, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"{fileName}.xlsx");
     }
 
     // ─── GET /api/report/monthly-cash/export ─────────────────────────────────

@@ -26,6 +26,7 @@ public class CashLoanDbContext : DbContext, ICashLoanDbContext
     public DbSet<ApprovalWorkflow> ApprovalWorkflows => Set<ApprovalWorkflow>();
     public DbSet<SafekeepingAccount> SafekeepingAccounts => Set<SafekeepingAccount>();
     public DbSet<SafekeepingTransaction> SafekeepingTransactions => Set<SafekeepingTransaction>();
+    public DbSet<AccountantTransaction> AccountantTransactions => Set<AccountantTransaction>();
 
     public override Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
     {
@@ -63,6 +64,16 @@ public class CashLoanDbContext : DbContext, ICashLoanDbContext
         modelBuilder.Entity<SafekeepingTransaction>()
             .Property(t => t.Amount)
             .HasColumnType("decimal(18,2)");
+
+        modelBuilder.Entity<AccountantTransaction>()
+            .Property(t => t.Amount)
+            .HasColumnType("decimal(18,2)");
+
+        modelBuilder.Entity<AccountantTransaction>()
+            .HasOne(t => t.CreatedByUser)
+            .WithMany()
+            .HasForeignKey(t => t.CreatedByUserId)
+            .OnDelete(DeleteBehavior.Restrict);
 
         // Safekeeping relationships
         modelBuilder.Entity<SafekeepingAccount>()
@@ -144,7 +155,8 @@ public class CashLoanDbContext : DbContext, ICashLoanDbContext
             new Role { Id = 2, Name = "Cashier", Description = "Cash transactions access" },
             new Role { Id = 3, Name = "Finance Officer", Description = "Loans and approvals access" },
             new Role { Id = 4, Name = "Manager", Description = "Reporting and approvals access" },
-            new Role { Id = 5, Name = "Auditor", Description = "Read-only reporting access" }
+            new Role { Id = 5, Name = "Auditor", Description = "Read-only reporting access" },
+            new Role { Id = 6, Name = "Accountant", Description = "Accountant cash book and financial reports" }
         );
     }
 }
