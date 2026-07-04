@@ -1,3 +1,4 @@
+using ClosedXML.Excel;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -249,6 +250,269 @@ public class SafekeepingController : BaseApiController
             $"Collection of ${txn.Amount:N2} for {txn.Account.DepositorName} was rejected. Reason: {reason}", NotificationType.PendingApproval);
 
         return Ok(new { message = "Withdrawal rejected.", reason });
+    }
+
+    // ─── GET /api/safekeeping/report/export (all accounts, xlsx/pdf) ──────────
+    [HttpGet("report/export")]
+    public async Task<IActionResult> ExportSummaryReport([FromQuery] string format = "xlsx")
+    {
+        var accounts = await _context.SafekeepingAccounts
+            .Include(a => a.Transactions)
+            .OrderBy(a => a.DepositorName)
+            .ToListAsync();
+
+        var data = accounts.Select(a =>
+        {
+            var deposits = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Deposit).ToList();
+            var collected = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Withdrawal &&
+                (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
+            return new
+            {
+                a.DepositorName, a.Phone,
+                NationalId = a.NationalId ?? "—",
+                FirstLeft  = deposits.Count > 0 ? deposits.Min(t => t.Date).ToString("dd MMM yyyy") : "—",
+                LastCollection = collected.Count > 0 ? collected.Max(t => t.Date).ToString("dd MMM yyyy") : "—",
+                Deposited  = deposits.Sum(t => t.Amount),
+                Collected  = collected.Sum(t => t.Amount),
+                Balance    = deposits.Sum(t => t.Amount) - collected.Sum(t => t.Amount)
+            };
+        }).ToList();
+
+        var totalHeld = data.Sum(d => d.Balance);
+        var title     = $"Safekeeping Summary — {DateTime.UtcNow:dd MMM yyyy}";
+        var fileName  = $"CALM_Safekeeping_Summary_{DateTime.UtcNow:yyyyMMdd}";
+
+        if (format.ToLower() == "pdf")
+        {
+            var rows = data.Select(d => new[]
+            {
+                d.DepositorName, d.Phone, d.NationalId, d.FirstLeft, d.LastCollection,
+                $"!g${d.Deposited:N2}", $"!r${d.Collected:N2}", $"${d.Balance:N2}"
+            }).ToList();
+            var ms = ReportPdf.Build(title,
+                new List<(string, string)> { ("Accounts", data.Count.ToString()), ("Total Held", $"${totalHeld:N2}") },
+                new[] { "Depositor", "Phone", "National ID", "First Left", "Last Collection", "Deposited", "Collected", "Balance" },
+                rows, rightAlign: new[] { 5, 6, 7 });
+            return File(ms, "application/pdf", $"{fileName}.pdf");
+        }
+
+        using var wb = new XLWorkbook();
+        var ws = wb.Worksheets.Add("Safekeeping");
+        ws.Cell("A1").Value = "CALM – Cash & Liquidity Management";
+        ws.Cell("A1").Style.Font.Bold = true; ws.Cell("A1").Style.Font.FontSize = 14;
+        ws.Cell("A2").Value = "Welble Investments P/L"; ws.Cell("A2").Style.Font.FontColor = XLColor.Gray;
+        ws.Cell("A3").Value = title; ws.Cell("A3").Style.Font.Bold = true;
+        ws.Cell("A5").Value = "Total Held"; ws.Cell("A5").Style.Font.Bold = true;
+        ws.Cell("B5").Value = totalHeld; ws.Cell("B5").Style.NumberFormat.Format = "$#,##0.00"; ws.Cell("B5").Style.Font.Bold = true;
+
+        var headers = new[] { "Depositor", "Phone", "National ID", "First Left", "Last Collection", "Deposited (USD)", "Collected (USD)", "Balance (USD)" };
+        int r = 7;
+        for (int c = 0; c < headers.Length; c++)
+        {
+            ws.Cell(r, c + 1).Value = headers[c];
+            ws.Cell(r, c + 1).Style.Font.Bold = true;
+            ws.Cell(r, c + 1).Style.Fill.BackgroundColor = XLColor.FromHtml("#1e293b");
+            ws.Cell(r, c + 1).Style.Font.FontColor = XLColor.White;
+        }
+        r++;
+        foreach (var d in data)
+        {
+            ws.Cell(r, 1).Value = d.DepositorName; ws.Cell(r, 2).Value = d.Phone; ws.Cell(r, 3).Value = d.NationalId;
+            ws.Cell(r, 4).Value = d.FirstLeft; ws.Cell(r, 5).Value = d.LastCollection;
+            ws.Cell(r, 6).Value = d.Deposited; ws.Cell(r, 6).Style.NumberFormat.Format = "$#,##0.00"; ws.Cell(r, 6).Style.Font.FontColor = XLColor.DarkGreen;
+            ws.Cell(r, 7).Value = d.Collected; ws.Cell(r, 7).Style.NumberFormat.Format = "$#,##0.00"; ws.Cell(r, 7).Style.Font.FontColor = XLColor.Red;
+            ws.Cell(r, 8).Value = d.Balance;   ws.Cell(r, 8).Style.NumberFormat.Format = "$#,##0.00"; ws.Cell(r, 8).Style.Font.Bold = true;
+            r++;
+        }
+        ws.Columns().AdjustToContents();
+        var xms = new MemoryStream(); wb.SaveAs(xms); xms.Position = 0;
+        return File(xms, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"{fileName}.xlsx");
+    }
+
+    // ─── GET /api/safekeeping/report/period/export (weekly|monthly, xlsx/pdf) ─
+    [HttpGet("report/period/export")]
+    public async Task<IActionResult> ExportPeriodReport(
+        [FromQuery] string period = "weekly",
+        [FromQuery] string? date = null,
+        [FromQuery] string? from = null,
+        [FromQuery] string? to = null,
+        [FromQuery] string format = "xlsx")
+    {
+        var (start, end, label, slug) = PeriodUtil.Range(period, date, from, to);
+
+        var txns = await _context.SafekeepingTransactions
+            .Include(t => t.Account).Include(t => t.CreatedByUser)
+            .Where(t => t.Date >= start && t.Date < end)
+            .OrderBy(t => t.Date)
+            .ToListAsync();
+
+        var deposits = txns.Where(t => t.Type == SafekeepingTransactionType.Deposit).Sum(t => t.Amount);
+        var collected = txns.Where(t => t.Type == SafekeepingTransactionType.Withdrawal &&
+            (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).Sum(t => t.Amount);
+
+        // Total currently held across all accounts
+        var allDeposits = await _context.SafekeepingTransactions
+            .Where(t => t.Type == SafekeepingTransactionType.Deposit && t.Date < end)
+            .SumAsync(t => (decimal?)t.Amount) ?? 0m;
+        var allCollected = await _context.SafekeepingTransactions
+            .Where(t => t.Type == SafekeepingTransactionType.Withdrawal && t.Date < end &&
+                       (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
+            .SumAsync(t => (decimal?)t.Amount) ?? 0m;
+
+        var periodName = from != null && to != null ? "Range"
+            : string.Equals(period, "monthly", StringComparison.OrdinalIgnoreCase) ? "Monthly" : "Weekly";
+        var title    = $"Safekeeping Report — {label}";
+        var fileName = $"CALM_Safekeeping_{periodName}_{slug}";
+
+        var summary = new List<(string, string)>
+        {
+            ("Deposits (left)",       $"${deposits:N2}"),
+            ("Collections (approved)",$"${collected:N2}"),
+            ("Net Movement",          $"${deposits - collected:N2}"),
+            ("Total Held (period end)", $"${allDeposits - allCollected:N2}")
+        };
+        var headers = new[] { "Date", "Depositor", "Type", "Status", "Amount", "Reference", "By" };
+
+        string StatusOf(SafekeepingTransaction t) =>
+            t.Type == SafekeepingTransactionType.Deposit ? "—" :
+            t.ApprovalStatus == CashApprovalStatus.Pending ? "Pending" :
+            t.ApprovalStatus == CashApprovalStatus.Rejected ? "Rejected" : "Approved";
+
+        if (format.ToLower() == "pdf")
+        {
+            var rows = txns.Select(t => new[]
+            {
+                t.Date.ToString("dd MMM HH:mm"),
+                t.Account.DepositorName,
+                t.Type == SafekeepingTransactionType.Deposit ? "Left" : "Collected",
+                StatusOf(t),
+                t.Type == SafekeepingTransactionType.Deposit ? $"!g+${t.Amount:N2}" : $"!r-${t.Amount:N2}",
+                t.Reference, t.CreatedByUser.FullName
+            }).ToList();
+            var pms = ReportPdf.Build(title, summary, headers, rows, rightAlign: new[] { 4 });
+            return File(pms, "application/pdf", $"{fileName}.pdf");
+        }
+
+        var xrows = txns.Select(t => new object?[]
+        {
+            t.Date.ToLocalTime().ToString("dd MMM yyyy HH:mm"),
+            t.Account.DepositorName,
+            t.Type == SafekeepingTransactionType.Deposit ? "Left" : "Collected",
+            StatusOf(t),
+            t.Type == SafekeepingTransactionType.Deposit ? t.Amount : -t.Amount,
+            t.Reference, t.CreatedByUser.FullName
+        }).ToList();
+        var ms = ExcelTable.Build(title, summary, headers, xrows);
+        return File(ms, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"{fileName}.xlsx");
+    }
+
+    // ─── GET /api/safekeeping/accounts/{id}/statement/export (xlsx/pdf) ───────
+    [HttpGet("accounts/{id:int}/statement/export")]
+    public async Task<IActionResult> ExportStatement(int id, [FromQuery] string format = "xlsx")
+    {
+        var account = await _context.SafekeepingAccounts
+            .Include(a => a.Transactions).ThenInclude(t => t.CreatedByUser)
+            .FirstOrDefaultAsync(a => a.Id == id);
+        if (account == null) return NotFound(new { message = "Account not found." });
+
+        var ordered = account.Transactions.OrderBy(t => t.Date).ToList();
+        decimal running = 0;
+        var lines = ordered.Select(t =>
+        {
+            var counts = t.Type == SafekeepingTransactionType.Deposit
+                         || t.ApprovalStatus == CashApprovalStatus.AutoApproved
+                         || t.ApprovalStatus == CashApprovalStatus.Approved;
+            if (counts) running += t.Type == SafekeepingTransactionType.Deposit ? t.Amount : -t.Amount;
+            return (Txn: t, Counts: counts, BalanceAfter: running);
+        }).ToList();
+
+        var deposits = ordered.Where(t => t.Type == SafekeepingTransactionType.Deposit).ToList();
+        var title    = $"Safekeeping Statement — {account.DepositorName}";
+        var fileName = $"CALM_Safekeeping_{account.DepositorName.Replace(' ', '_')}_{DateTime.UtcNow:yyyyMMdd}";
+        var summary  = new List<(string, string)>
+        {
+            ("Depositor",       account.DepositorName),
+            ("Phone",           account.Phone),
+            ("Date First Left", deposits.Count > 0 ? deposits.Min(t => t.Date).ToString("dd MMM yyyy") : "—"),
+            ("Total Deposited", $"${deposits.Sum(t => t.Amount):N2}"),
+            ("Total Collected", $"${deposits.Sum(t => t.Amount) - running:N2}"),
+            ("Remaining Balance", $"${running:N2}")
+        };
+
+        if (format.ToLower() == "pdf")
+        {
+            var rows = lines.Select(l => new[]
+            {
+                l.Txn.Date.ToString("dd MMM yyyy HH:mm"),
+                l.Txn.Type == SafekeepingTransactionType.Deposit ? "Left" : "Collected",
+                l.Txn.Type == SafekeepingTransactionType.Deposit ? "—" :
+                    l.Txn.ApprovalStatus == CashApprovalStatus.Pending ? "Pending" :
+                    l.Txn.ApprovalStatus == CashApprovalStatus.Rejected ? "Rejected" : "Approved",
+                l.Txn.Type == SafekeepingTransactionType.Deposit ? $"!g+${l.Txn.Amount:N2}" : $"!r-${l.Txn.Amount:N2}",
+                l.Counts ? $"${l.BalanceAfter:N2}" : "—",
+                l.Txn.Reference,
+                l.Txn.CreatedByUser.FullName
+            }).ToList();
+            var ms = ReportPdf.Build(title, summary,
+                new[] { "Date", "Type", "Status", "Amount", "Balance After", "Reference", "By" },
+                rows, rightAlign: new[] { 3, 4 });
+            return File(ms, "application/pdf", $"{fileName}.pdf");
+        }
+
+        using var wb = new XLWorkbook();
+        var ws = wb.Worksheets.Add("Statement");
+        ws.Cell("A1").Value = "CALM – Cash & Liquidity Management";
+        ws.Cell("A1").Style.Font.Bold = true; ws.Cell("A1").Style.Font.FontSize = 14;
+        ws.Cell("A2").Value = "Welble Investments P/L"; ws.Cell("A2").Style.Font.FontColor = XLColor.Gray;
+        ws.Cell("A3").Value = title; ws.Cell("A3").Style.Font.Bold = true;
+
+        int r = 5;
+        foreach (var (label, value) in summary)
+        {
+            ws.Cell(r, 1).Value = label; ws.Cell(r, 2).Value = value;
+            if (label == "Remaining Balance") { ws.Cell(r, 1).Style.Font.Bold = true; ws.Cell(r, 2).Style.Font.Bold = true; }
+            r++;
+        }
+
+        r++;
+        var headers = new[] { "Date", "Type", "Status", "DR Amount (USD)", "CR Amount (USD)", "Balance After", "Reference", "Recorded By" };
+        for (int c = 0; c < headers.Length; c++)
+        {
+            ws.Cell(r, c + 1).Value = headers[c];
+            ws.Cell(r, c + 1).Style.Font.Bold = true;
+            ws.Cell(r, c + 1).Style.Fill.BackgroundColor = XLColor.FromHtml("#1e293b");
+            ws.Cell(r, c + 1).Style.Font.FontColor = XLColor.White;
+        }
+        r++;
+        foreach (var l in lines)
+        {
+            var isDeposit = l.Txn.Type == SafekeepingTransactionType.Deposit;
+            ws.Cell(r, 1).Value = l.Txn.Date.ToLocalTime().ToString("dd MMM yyyy HH:mm");
+            ws.Cell(r, 2).Value = isDeposit ? "Left" : "Collected";
+            ws.Cell(r, 3).Value = isDeposit ? "—" :
+                l.Txn.ApprovalStatus == CashApprovalStatus.Pending ? "Pending" :
+                l.Txn.ApprovalStatus == CashApprovalStatus.Rejected ? "Rejected" : "Approved";
+            if (!isDeposit)
+            {
+                ws.Cell(r, 4).Value = -l.Txn.Amount;
+                ws.Cell(r, 4).Style.NumberFormat.Format = "$#,##0.00";
+                ws.Cell(r, 4).Style.Font.FontColor = XLColor.Red;
+            }
+            else
+            {
+                ws.Cell(r, 5).Value = l.Txn.Amount;
+                ws.Cell(r, 5).Style.NumberFormat.Format = "$#,##0.00";
+                ws.Cell(r, 5).Style.Font.FontColor = XLColor.DarkGreen;
+            }
+            if (l.Counts) { ws.Cell(r, 6).Value = l.BalanceAfter; ws.Cell(r, 6).Style.NumberFormat.Format = "$#,##0.00"; }
+            else ws.Cell(r, 6).Value = "—";
+            ws.Cell(r, 7).Value = l.Txn.Reference;
+            ws.Cell(r, 8).Value = l.Txn.CreatedByUser.FullName;
+            r++;
+        }
+        ws.Columns().AdjustToContents();
+        var xms2 = new MemoryStream(); wb.SaveAs(xms2); xms2.Position = 0;
+        return File(xms2, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"{fileName}.xlsx");
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────

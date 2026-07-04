@@ -153,6 +153,106 @@ public class ReportController : BaseApiController
         });
     }
 
+    // ─── GET /api/report/weekly-cash ─────────────────────────────────────────
+    /// <summary>Weekly (Mon–Sun) cash summary for the week containing the given date.</summary>
+    [HttpGet("weekly-cash")]
+    public async Task<IActionResult> GetWeeklyCashSummary([FromQuery] string? date)
+    {
+        var raw = DateTime.TryParse(date, out var p) ? p : DateTime.UtcNow;
+        // Monday of the containing week
+        var offset    = ((int)raw.DayOfWeek + 6) % 7;
+        var weekStart = DateTime.SpecifyKind(raw.Date.AddDays(-offset), DateTimeKind.Utc);
+        var weekEnd   = weekStart.AddDays(7);
+
+        var txns = await _context.CashTransactions
+            .Where(t => t.Date >= weekStart && t.Date < weekEnd)
+            .ToListAsync();
+
+        var days = Enumerable.Range(0, 7).Select(i =>
+        {
+            var d    = weekStart.AddDays(i);
+            var dStr = d.ToString("yyyy-MM-dd");
+            var dayTxns = txns.Where(t => t.Date.ToString("yyyy-MM-dd") == dStr).ToList();
+            var adds = dayTxns.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
+            var disb = dayTxns.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+            return new
+            {
+                date = dStr, dayOfWeek = d.DayOfWeek.ToString(),
+                additions = adds, disbursements = disb,
+                net = adds - disb, txnCount = dayTxns.Count
+            };
+        }).ToList();
+
+        var totalAdditions     = txns.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
+        var totalDisbursements = txns.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var newLoans   = await _context.Loans.CountAsync(l => l.CreatedAt >= weekStart && l.CreatedAt < weekEnd);
+        var repayments = await _context.LoanRepayments
+            .Where(r => r.RepaymentDate >= weekStart && r.RepaymentDate < weekEnd)
+            .SumAsync(r => (decimal?)r.Amount) ?? 0m;
+
+        return Ok(new
+        {
+            weekStart = weekStart.ToString("yyyy-MM-dd"),
+            weekEnd   = weekStart.AddDays(6).ToString("yyyy-MM-dd"),
+            label     = $"{weekStart:dd MMM} – {weekStart.AddDays(6):dd MMM yyyy}",
+            totalAdditions, totalDisbursements,
+            netCashFlow = totalAdditions - totalDisbursements,
+            newLoansCount = newLoans,
+            totalRepaymentsCollected = repayments,
+            activeDays = days.Count(d => d.txnCount > 0),
+            days
+        });
+    }
+
+    // ─── GET /api/report/range-cash ──────────────────────────────────────────
+    /// <summary>Cash summary for an arbitrary inclusive date range (max 92 days).</summary>
+    [HttpGet("range-cash")]
+    public async Task<IActionResult> GetRangeCashSummary([FromQuery] string from, [FromQuery] string to)
+    {
+        if (!DateTime.TryParse(from, out var f) || !DateTime.TryParse(to, out var t))
+            return BadRequest(new { message = "Both 'from' and 'to' dates are required (yyyy-MM-dd)." });
+
+        var start = DateTime.SpecifyKind(f.Date, DateTimeKind.Utc);
+        var end   = DateTime.SpecifyKind(t.Date.AddDays(1), DateTimeKind.Utc);
+        if (end <= start) return BadRequest(new { message = "'to' must be on or after 'from'." });
+        var dayCount = (int)(end - start).TotalDays;
+        if (dayCount > 92) return BadRequest(new { message = "Date range cannot exceed 92 days." });
+
+        var txns = await _context.CashTransactions
+            .Where(x => x.Date >= start && x.Date < end)
+            .ToListAsync();
+
+        var days = Enumerable.Range(0, dayCount).Select(i =>
+        {
+            var d    = start.AddDays(i);
+            var dStr = d.ToString("yyyy-MM-dd");
+            var dayTxns = txns.Where(x => x.Date.ToString("yyyy-MM-dd") == dStr).ToList();
+            var adds = dayTxns.Where(x => x.Type == TransactionType.Addition || x.Type == TransactionType.OpeningBalance).Sum(x => x.Amount);
+            var disb = dayTxns.Where(x => x.Type == TransactionType.Disbursement).Sum(x => x.Amount);
+            return new { date = dStr, dayOfWeek = d.DayOfWeek.ToString(), additions = adds, disbursements = disb, net = adds - disb, txnCount = dayTxns.Count };
+        }).ToList();
+
+        var totalAdditions     = txns.Where(x => x.Type == TransactionType.Addition || x.Type == TransactionType.OpeningBalance).Sum(x => x.Amount);
+        var totalDisbursements = txns.Where(x => x.Type == TransactionType.Disbursement).Sum(x => x.Amount);
+        var newLoans   = await _context.Loans.CountAsync(l => l.CreatedAt >= start && l.CreatedAt < end);
+        var repayments = await _context.LoanRepayments
+            .Where(r => r.RepaymentDate >= start && r.RepaymentDate < end)
+            .SumAsync(r => (decimal?)r.Amount) ?? 0m;
+
+        return Ok(new
+        {
+            from = start.ToString("yyyy-MM-dd"),
+            to   = end.AddDays(-1).ToString("yyyy-MM-dd"),
+            label = $"{start:dd MMM yyyy} – {end.AddDays(-1):dd MMM yyyy}",
+            totalAdditions, totalDisbursements,
+            netCashFlow = totalAdditions - totalDisbursements,
+            newLoansCount = newLoans,
+            totalRepaymentsCollected = repayments,
+            activeDays = days.Count(d => d.txnCount > 0),
+            days
+        });
+    }
+
     // ─── GET /api/report/loans ───────────────────────────────────────────────
     [HttpGet("loans")]
     public async Task<IActionResult> GetLoanReport()

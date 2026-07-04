@@ -117,11 +117,13 @@ public class AccountantController : BaseApiController
         return Ok(new { total, page, pageSize, transactions = txns });
     }
 
-    // ─── GET /api/accountant/daily-report ─────────────────────────────────────
+    // ─── GET /api/accountant/daily-report (period=daily|weekly|monthly) ───────
     [HttpGet("daily-report")]
-    public async Task<IActionResult> GetDailyReport([FromQuery] string? date)
+    public async Task<IActionResult> GetDailyReport(
+        [FromQuery] string? date, [FromQuery] string period = "daily",
+        [FromQuery] string? from = null, [FromQuery] string? to = null)
     {
-        var (dayStart, dayEnd) = DayRange(date);
+        var (dayStart, dayEnd, _, _) = ResolveRange(period, date, from, to);
         var txns = await DayTransactionsAsync(dayStart, dayEnd);
         var opening = await BalanceBeforeAsync(dayStart);
         var added     = txns.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
@@ -140,36 +142,75 @@ public class AccountantController : BaseApiController
         });
     }
 
-    // ─── GET /api/accountant/daily-report/export (Excel, DR/CR format) ────────
+    // ─── GET /api/accountant/daily-report/export (period + xlsx/pdf) ──────────
     [HttpGet("daily-report/export")]
-    public async Task<IActionResult> ExportDailyReport([FromQuery] string? date)
+    public async Task<IActionResult> ExportDailyReport(
+        [FromQuery] string? date,
+        [FromQuery] string period = "daily",
+        [FromQuery] string? from = null,
+        [FromQuery] string? to = null,
+        [FromQuery] string format = "xlsx")
     {
-        var (dayStart, dayEnd) = DayRange(date);
+        var (dayStart, dayEnd, label, slug) = ResolveRange(period, date, from, to);
         var txns = await DayTransactionsAsync(dayStart, dayEnd);
         var opening   = await BalanceBeforeAsync(dayStart);
         var added     = txns.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
         var disbursed = txns.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var closing   = opening + added - disbursed;
+
+        var periodName = from != null && to != null ? "Range" : char.ToUpper(period[0]) + period[1..].ToLower();
+        var title    = $"Accountant Cash Report — {label}";
+        var fileName = $"CALM_Accountant_{periodName}_{slug}";
+
+        if (format.ToLower() == "pdf")
+        {
+            var pdfRows = txns.Select(t =>
+            {
+                var isDebit = t.Type == TransactionType.Disbursement;
+                return new[]
+                {
+                    t.Date.ToLocalTime().ToString("dd MMM HH:mm"),
+                    t.Type.ToString(),
+                    isDebit ? $"!r-${t.Amount:N2}" : "",
+                    isDebit ? "" : $"!g${t.Amount:N2}",
+                    t.SourceOrPurpose, t.Reference, t.CreatedByUser.FullName
+                };
+            }).ToList();
+            var pms = ReportPdf.Build(title,
+                new List<(string, string)>
+                {
+                    ("Opening Balance", $"${opening:N2}"),
+                    ("Cash Added",      $"${added:N2}"),
+                    ("Cash Disbursed",  $"${disbursed:N2}"),
+                    ("Closing Balance", $"${closing:N2}")
+                },
+                new[] { "Time", "Type", "DR Amount (USD)", "CR Amount (USD)", "Source / Purpose", "Reference", "Recorded By" },
+                pdfRows, rightAlign: new[] { 2, 3 });
+            return File(pms, "application/pdf", $"{fileName}.pdf");
+        }
 
         var rows = txns.Select(t => (
             Time: t.Date, Type: t.Type, Amount: t.Amount,
             Source: t.SourceOrPurpose, Reference: t.Reference,
             By: t.CreatedByUser.FullName)).ToList();
 
-        var ms = DrCrExcel.Build(
-            title: $"Accountant Daily Cash Report — {dayStart:dd MMM yyyy}",
-            opening: opening, added: added, disbursed: disbursed,
-            closing: opening + added - disbursed, rows: rows);
-
-        return File(ms, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            $"CALM_Accountant_Daily_{dayStart:yyyyMMdd}.xlsx");
+        var ms = DrCrExcel.Build(title, opening, added, disbursed, closing, rows);
+        return File(ms, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"{fileName}.xlsx");
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
-    private static (DateTime start, DateTime end) DayRange(string? date)
+    private static (DateTime start, DateTime end, string label, string slug) ResolveRange(
+        string? period, string? date, string? from = null, string? to = null)
     {
+        if (from != null && to != null)
+            return PeriodUtil.Range(period, date, from, to);
+        if (string.Equals(period, "weekly", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(period, "monthly", StringComparison.OrdinalIgnoreCase))
+            return PeriodUtil.Range(period, date);
+
         var raw = DateTime.TryParse(date, out var p) ? p : DateTime.UtcNow;
         var s = DateTime.SpecifyKind(raw.Date, DateTimeKind.Utc);
-        return (s, s.AddDays(1));
+        return (s, s.AddDays(1), s.ToString("dd MMM yyyy"), s.ToString("yyyyMMdd"));
     }
 
     private Task<List<AccountantTransaction>> DayTransactionsAsync(DateTime s, DateTime e) =>
