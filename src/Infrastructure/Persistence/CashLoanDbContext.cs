@@ -75,6 +75,18 @@ public class CashLoanDbContext : DbContext, ICashLoanDbContext
             .HasForeignKey(t => t.CreatedByUserId)
             .OnDelete(DeleteBehavior.Restrict);
 
+        modelBuilder.Entity<AccountantTransaction>()
+            .HasOne(t => t.ReversalRequestedByUser)
+            .WithMany()
+            .HasForeignKey(t => t.ReversalRequestedByUserId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        modelBuilder.Entity<AccountantTransaction>()
+            .HasOne(t => t.ReversalApprovedByUser)
+            .WithMany()
+            .HasForeignKey(t => t.ReversalApprovedByUserId)
+            .OnDelete(DeleteBehavior.Restrict);
+
         // Safekeeping relationships
         modelBuilder.Entity<SafekeepingAccount>()
             .HasOne(a => a.CreatedByUser)
@@ -123,6 +135,18 @@ public class CashLoanDbContext : DbContext, ICashLoanDbContext
             .HasOne(t => t.ApprovedByUser)
             .WithMany()
             .HasForeignKey(t => t.ApprovedByUserId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        modelBuilder.Entity<CashTransaction>()
+            .HasOne(t => t.ReversalRequestedByUser)
+            .WithMany()
+            .HasForeignKey(t => t.ReversalRequestedByUserId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        modelBuilder.Entity<CashTransaction>()
+            .HasOne(t => t.ReversalApprovedByUser)
+            .WithMany()
+            .HasForeignKey(t => t.ReversalApprovedByUserId)
             .OnDelete(DeleteBehavior.Restrict);
 
         modelBuilder.Entity<CashReconciliation>()

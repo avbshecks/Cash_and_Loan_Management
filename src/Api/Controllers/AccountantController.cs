@@ -2,6 +2,7 @@ using ClosedXML.Excel;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using CashLoanManagement.Application.Common.Interfaces;
 using CashLoanManagement.Domain.Entities;
 using CashLoanManagement.Domain.Enums;
 using CashLoanManagement.Infrastructure.Persistence;
@@ -18,14 +19,16 @@ public class AccountantMovementDto
 /// The accountant's own cash book — a separate float from the main
 /// operational cashbox. Accessible to Accountant, Admin and Manager.
 /// </summary>
-[Authorize(Roles = "Admin,Manager,Accountant")]
+[Authorize(Roles = "Admin,Manager,Accountant,Finance Officer,Auditor")]
 public class AccountantController : BaseApiController
 {
     private readonly CashLoanDbContext _context;
+    private readonly INotificationService _notificationService;
 
-    public AccountantController(CashLoanDbContext context)
+    public AccountantController(CashLoanDbContext context, INotificationService notificationService)
     {
         _context = context;
+        _notificationService = notificationService;
     }
 
     // ─── GET /api/accountant/balance ──────────────────────────────────────────
@@ -38,6 +41,7 @@ public class AccountantController : BaseApiController
 
     // ─── POST /api/accountant/opening-balance (one-time) ──────────────────────
     [HttpPost("opening-balance")]
+    [Authorize(Roles = "Admin,Accountant")]
     public async Task<IActionResult> SetInitialOpeningBalance([FromBody] AccountantMovementDto request)
     {
         if (request.Amount < 0) return BadRequest(new { message = "Opening balance cannot be negative." });
@@ -59,6 +63,7 @@ public class AccountantController : BaseApiController
 
     // ─── POST /api/accountant/add ─────────────────────────────────────────────
     [HttpPost("add")]
+    [Authorize(Roles = "Admin,Accountant")]
     public async Task<IActionResult> AddCash([FromBody] AccountantMovementDto request)
     {
         if (request.Amount <= 0) return BadRequest(new { message = "Amount must be greater than zero." });
@@ -78,6 +83,7 @@ public class AccountantController : BaseApiController
 
     // ─── POST /api/accountant/disburse ────────────────────────────────────────
     [HttpPost("disburse")]
+    [Authorize(Roles = "Admin,Accountant")]
     public async Task<IActionResult> Disburse([FromBody] AccountantMovementDto request)
     {
         if (request.Amount <= 0) return BadRequest(new { message = "Amount must be greater than zero." });
@@ -111,10 +117,132 @@ public class AccountantController : BaseApiController
             .Select(t => new
             {
                 t.Id, t.Date, t.Amount, type = t.Type.ToString(),
-                t.SourceOrPurpose, t.Reference, createdBy = t.CreatedByUser.FullName
+                t.SourceOrPurpose, t.Reference, createdBy = t.CreatedByUser.FullName,
+                t.IsReversed,
+                isReversal = t.ReversalOfTransactionId != null,
+                reversalStatus = t.ReversalStatus != null ? t.ReversalStatus.ToString() : null
             })
             .ToListAsync();
         return Ok(new { total, page, pageSize, transactions = txns });
+    }
+
+    // ─── POST /api/accountant/reverse/{id} (MAKER: Accountant/Admin request) ──
+    [HttpPost("reverse/{id:int}")]
+    [Authorize(Roles = "Admin,Accountant")]
+    public async Task<IActionResult> RequestReversal(int id, [FromBody] string reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return BadRequest(new { message = "A reason for the reversal is required." });
+
+        var original = await _context.AccountantTransactions.FirstOrDefaultAsync(t => t.Id == id);
+        if (original == null) return NotFound(new { message = "Transaction not found." });
+        if (original.ReversalOfTransactionId != null)
+            return BadRequest(new { message = "You cannot reverse a reversal entry." });
+        if (original.IsReversed)
+            return BadRequest(new { message = "This transaction has already been reversed." });
+        if (original.ReversalStatus == CashApprovalStatus.Pending)
+            return BadRequest(new { message = "A reversal request is already pending for this transaction." });
+
+        var userId = GetCurrentUserId();
+        original.ReversalStatus = CashApprovalStatus.Pending;
+        original.ReversalReason = reason;
+        original.ReversalRequestedByUserId = userId;
+        original.ReversalRequestedAt = DateTime.UtcNow;
+        original.UpdatedAt = DateTime.UtcNow;
+
+        await LogAuditAsync($"Accountant book: reversal requested for {original.Reference} (${original.Amount:N2}). Reason: {reason}. AWAITING APPROVAL.");
+        await _context.SaveChangesAsync();
+
+        await _notificationService.NotifyRoleAsync("Manager", "Accountant Book Reversal Pending Approval",
+            $"Reversal of {original.Reference} (${original.Amount:N2}) needs your approval.", NotificationType.PendingApproval);
+
+        return Ok(new { message = "Reversal requested and sent for approval.", status = "PendingApproval" });
+    }
+
+    // ─── GET /api/accountant/pending-reversals (CHECKER) ──────────────────────
+    [HttpGet("pending-reversals")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> GetPendingReversals()
+    {
+        var pending = await _context.AccountantTransactions
+            .Include(t => t.CreatedByUser)
+            .Include(t => t.ReversalRequestedByUser)
+            .Where(t => t.ReversalStatus == CashApprovalStatus.Pending)
+            .OrderBy(t => t.ReversalRequestedAt)
+            .Select(t => new
+            {
+                t.Id, t.Date, t.Amount, type = t.Type.ToString(), t.SourceOrPurpose, t.Reference,
+                t.ReversalReason, t.ReversalRequestedAt,
+                requestedBy = t.ReversalRequestedByUser!.FullName,
+                originalPostedBy = t.CreatedByUser.FullName
+            })
+            .ToListAsync();
+        return Ok(pending);
+    }
+
+    // ─── POST /api/accountant/reverse/{id}/approve (CHECKER) ──────────────────
+    [HttpPost("reverse/{id:int}/approve")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> ApproveReversal(int id)
+    {
+        var original = await _context.AccountantTransactions.FirstOrDefaultAsync(t => t.Id == id);
+        if (original == null) return NotFound(new { message = "Transaction not found." });
+        if (original.ReversalStatus != CashApprovalStatus.Pending)
+            return BadRequest(new { message = "No pending reversal request for this transaction." });
+
+        var userId = GetCurrentUserId();
+        _context.AccountantTransactions.Add(new AccountantTransaction
+        {
+            Amount          = -original.Amount,
+            Type            = original.Type,
+            SourceOrPurpose = $"Reversal of {original.Reference}: {original.ReversalReason}",
+            Reference       = $"REV-{original.Reference}",
+            Date            = DateTime.UtcNow,
+            ReversalOfTransactionId = original.Id,
+            CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
+        });
+
+        original.IsReversed = true;
+        original.ReversalStatus = CashApprovalStatus.Approved;
+        original.ReversalApprovedByUserId = userId;
+        original.ReversalApprovedAt = DateTime.UtcNow;
+        original.UpdatedAt = DateTime.UtcNow;
+
+        await LogAuditAsync($"Accountant book: reversal APPROVED for {original.Reference} (${original.Amount:N2}).");
+        await _context.SaveChangesAsync();
+
+        if (original.ReversalRequestedByUserId.HasValue)
+            await _notificationService.NotifyUserAsync(original.ReversalRequestedByUserId.Value, "Reversal Approved",
+                $"Your accountant-book reversal request for {original.Reference} was approved.", NotificationType.PendingApproval);
+
+        return Ok(new { message = $"Transaction {original.Reference} reversed.", newBalance = await ComputeBalanceAsync() });
+    }
+
+    // ─── POST /api/accountant/reverse/{id}/reject (CHECKER) ───────────────────
+    [HttpPost("reverse/{id:int}/reject")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> RejectReversal(int id, [FromBody] string reason)
+    {
+        var original = await _context.AccountantTransactions.FirstOrDefaultAsync(t => t.Id == id);
+        if (original == null) return NotFound(new { message = "Transaction not found." });
+        if (original.ReversalStatus != CashApprovalStatus.Pending)
+            return BadRequest(new { message = "No pending reversal request for this transaction." });
+
+        var userId = GetCurrentUserId();
+        original.ReversalStatus = CashApprovalStatus.Rejected;
+        original.ReversalRejectionReason = reason;
+        original.ReversalApprovedByUserId = userId;
+        original.ReversalApprovedAt = DateTime.UtcNow;
+        original.UpdatedAt = DateTime.UtcNow;
+
+        await LogAuditAsync($"Accountant book: reversal REJECTED for {original.Reference}. Reason: {reason}");
+        await _context.SaveChangesAsync();
+
+        if (original.ReversalRequestedByUserId.HasValue)
+            await _notificationService.NotifyUserAsync(original.ReversalRequestedByUserId.Value, "Reversal Rejected",
+                $"Your accountant-book reversal request for {original.Reference} was rejected. Reason: {reason}", NotificationType.PendingApproval);
+
+        return Ok(new { message = "Reversal request rejected.", reason });
     }
 
     // ─── GET /api/accountant/daily-report (period=daily|weekly|monthly) ───────
@@ -137,7 +265,10 @@ public class AccountantController : BaseApiController
             transactions = txns.Select(t => new
             {
                 t.Id, t.Date, t.Amount, type = t.Type.ToString(),
-                t.SourceOrPurpose, t.Reference, createdBy = t.CreatedByUser.FullName
+                t.SourceOrPurpose, t.Reference, createdBy = t.CreatedByUser.FullName,
+                t.IsReversed,
+                isReversal = t.ReversalOfTransactionId != null,
+                reversalStatus = t.ReversalStatus != null ? t.ReversalStatus.ToString() : null
             })
         });
     }

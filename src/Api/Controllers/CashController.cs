@@ -41,7 +41,7 @@ public class CashController : BaseApiController
     /// is no daily manual capture.
     /// </summary>
     [HttpPost("opening-balance")]
-    [Authorize(Roles = "Admin,Manager")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> SetInitialOpeningBalance([FromBody] SetOpeningBalanceDto request)
     {
         if (request.Amount < 0)
@@ -69,6 +69,7 @@ public class CashController : BaseApiController
 
     // ─── POST /api/cash/add ───────────────────────────────────────────────────
     [HttpPost("add")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> AddCash([FromBody] AddCashDto request)
     {
         if (request.Amount <= 0) return BadRequest(new { message = "Amount must be greater than zero." });
@@ -91,6 +92,7 @@ public class CashController : BaseApiController
 
     // ─── POST /api/cash/disburse (MAKER) ─────────────────────────────────────
     [HttpPost("disburse")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> DisburseCash([FromBody] DisburseCashDto request)
     {
         if (request.Amount <= 0) return BadRequest(new { message = "Amount must be greater than zero." });
@@ -143,6 +145,7 @@ public class CashController : BaseApiController
 
     // ─── POST /api/cash/approve/{id} ──────────────────────────────────────── CHECKER
     [HttpPost("approve/{id:int}")]
+    [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> ApproveDisbursement(int id)
     {
         var tx = await _context.CashTransactions
@@ -180,6 +183,7 @@ public class CashController : BaseApiController
 
     // ─── POST /api/cash/reject/{id} ───────────────────────────────────────── CHECKER
     [HttpPost("reject/{id:int}")]
+    [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> RejectDisbursement(int id, [FromBody] string reason)
     {
         var tx = await _context.CashTransactions
@@ -246,6 +250,7 @@ public class CashController : BaseApiController
                 t.RejectionReason,
                 t.IsReversed,
                 isReversal = t.ReversalOfTransactionId != null,
+                reversalStatus = t.ReversalStatus != null ? t.ReversalStatus.ToString() : null,
                 createdBy  = t.CreatedByUser.FullName,
                 approvedBy = t.ApprovedByUser != null ? t.ApprovedByUser.FullName : null,
                 t.ApprovedAt
@@ -255,16 +260,16 @@ public class CashController : BaseApiController
         return Ok(new { total, page, pageSize, transactions = txns });
     }
 
-    // ─── POST /api/cash/reverse/{id} ──────────────────────────────────────────
+    // ─── POST /api/cash/reverse/{id} (MAKER: request a reversal) ──────────────
     /// <summary>
-    /// Reverses a posted cash transaction by creating an equal, opposite-signed
-    /// contra entry of the same type (e.g. an entry of 1000 entered by mistake is
-    /// netted to zero). The original is preserved and flagged reversed; the user
-    /// then re-posts the correct amount normally. Admin/Manager only.
+    /// Requests reversal of a mistaken cash entry (e.g. 1000 captured instead of 100).
+    /// This only flags the entry as Pending reversal — the balance is NOT touched
+    /// yet. A Manager/Admin must approve before the actual contra entry is posted.
+    /// Requestable by Cashier or Admin.
     /// </summary>
     [HttpPost("reverse/{id:int}")]
-    [Authorize(Roles = "Admin,Manager")]
-    public async Task<IActionResult> ReverseTransaction(int id, [FromBody] string reason)
+    [Authorize(Roles = "Admin,Cashier")]
+    public async Task<IActionResult> RequestReversal(int id, [FromBody] string reason)
     {
         if (string.IsNullOrWhiteSpace(reason))
             return BadRequest(new { message = "A reason for the reversal is required." });
@@ -276,22 +281,69 @@ public class CashController : BaseApiController
             return BadRequest(new { message = "You cannot reverse a reversal entry." });
         if (original.IsReversed)
             return BadRequest(new { message = "This transaction has already been reversed." });
+        if (original.ReversalStatus == CashApprovalStatus.Pending)
+            return BadRequest(new { message = "A reversal request is already pending for this transaction." });
 
-        // Only posted (counted) entries can be reversed. Pending disbursements should
-        // be rejected via /cash/reject instead.
         var isCounted = original.ApprovalStatus == CashApprovalStatus.AutoApproved
                      || original.ApprovalStatus == CashApprovalStatus.Approved;
         if (!isCounted)
             return BadRequest(new { message = $"Only posted transactions can be reversed (this one is {original.ApprovalStatus}). Reject pending disbursements instead." });
 
         var userId = GetCurrentUserId();
+        original.ReversalStatus = CashApprovalStatus.Pending;
+        original.ReversalReason = reason;
+        original.ReversalRequestedByUserId = userId;
+        original.ReversalRequestedAt = DateTime.UtcNow;
+        original.UpdatedAt = DateTime.UtcNow;
 
-        // Contra entry: same type, negative amount, auto-approved — nets the original to zero.
+        await LogAuditAsync(userId, $"Reversal requested for transaction {original.Reference} (${original.Amount:N2} {original.Type}). Reason: {reason}. AWAITING APPROVAL.");
+        await _context.SaveChangesAsync();
+
+        await _notificationService.NotifyRoleAsync("Manager", "Cash Reversal Pending Approval",
+            $"Reversal of {original.Reference} (${original.Amount:N2}) needs your approval.", NotificationType.PendingApproval);
+
+        return Ok(new { message = "Reversal requested and sent for approval.", status = "PendingApproval" });
+    }
+
+    // ─── GET /api/cash/pending-reversals (CHECKER) ────────────────────────────
+    [HttpGet("pending-reversals")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> GetPendingReversals()
+    {
+        var pending = await _context.CashTransactions
+            .Include(t => t.CreatedByUser)
+            .Include(t => t.ReversalRequestedByUser)
+            .Where(t => t.ReversalStatus == CashApprovalStatus.Pending)
+            .OrderBy(t => t.ReversalRequestedAt)
+            .Select(t => new
+            {
+                t.Id, t.Date, t.Amount, type = t.Type.ToString(), t.SourceOrPurpose, t.Reference,
+                t.ReversalReason, t.ReversalRequestedAt,
+                requestedBy = t.ReversalRequestedByUser!.FullName,
+                originalPostedBy = t.CreatedByUser.FullName
+            })
+            .ToListAsync();
+        return Ok(pending);
+    }
+
+    // ─── POST /api/cash/reverse/{id}/approve (CHECKER) ────────────────────────
+    [HttpPost("reverse/{id:int}/approve")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> ApproveReversal(int id)
+    {
+        var original = await _context.CashTransactions.FirstOrDefaultAsync(t => t.Id == id);
+        if (original == null) return NotFound(new { message = "Transaction not found." });
+        if (original.ReversalStatus != CashApprovalStatus.Pending)
+            return BadRequest(new { message = "No pending reversal request for this transaction." });
+
+        var userId = GetCurrentUserId();
+
+        // Post the contra entry now — this is the moment the balance actually changes.
         var reversal = new CashTransaction
         {
             Amount          = -original.Amount,
             Type            = original.Type,
-            SourceOrPurpose = $"Reversal of {original.Reference}: {reason}",
+            SourceOrPurpose = $"Reversal of {original.Reference}: {original.ReversalReason}",
             Reference       = $"REV-{original.Reference}",
             Date            = DateTime.UtcNow,
             ApprovalStatus  = CashApprovalStatus.Approved,
@@ -302,10 +354,17 @@ public class CashController : BaseApiController
         _context.CashTransactions.Add(reversal);
 
         original.IsReversed = true;
-        original.UpdatedAt  = DateTime.UtcNow;
+        original.ReversalStatus = CashApprovalStatus.Approved;
+        original.ReversalApprovedByUserId = userId;
+        original.ReversalApprovedAt = DateTime.UtcNow;
+        original.UpdatedAt = DateTime.UtcNow;
 
-        await LogAuditAsync(userId, $"Reversed transaction {original.Reference} (${original.Amount:N2} {original.Type}). Reason: {reason}");
+        await LogAuditAsync(userId, $"Reversal APPROVED for transaction {original.Reference} (${original.Amount:N2} {original.Type}).");
         await _context.SaveChangesAsync();
+
+        if (original.ReversalRequestedByUserId.HasValue)
+            await _notificationService.NotifyUserAsync(original.ReversalRequestedByUserId.Value, "Reversal Approved",
+                $"Your reversal request for {original.Reference} was approved.", NotificationType.PendingApproval);
 
         return Ok(new
         {
@@ -313,6 +372,33 @@ public class CashController : BaseApiController
             reversalReference = reversal.Reference,
             newBalance    = await ComputeBalanceAsync()
         });
+    }
+
+    // ─── POST /api/cash/reverse/{id}/reject (CHECKER) ─────────────────────────
+    [HttpPost("reverse/{id:int}/reject")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> RejectReversal(int id, [FromBody] string reason)
+    {
+        var original = await _context.CashTransactions.FirstOrDefaultAsync(t => t.Id == id);
+        if (original == null) return NotFound(new { message = "Transaction not found." });
+        if (original.ReversalStatus != CashApprovalStatus.Pending)
+            return BadRequest(new { message = "No pending reversal request for this transaction." });
+
+        var userId = GetCurrentUserId();
+        original.ReversalStatus = CashApprovalStatus.Rejected;
+        original.ReversalRejectionReason = reason;
+        original.ReversalApprovedByUserId = userId;
+        original.ReversalApprovedAt = DateTime.UtcNow;
+        original.UpdatedAt = DateTime.UtcNow;
+
+        await LogAuditAsync(userId, $"Reversal REJECTED for transaction {original.Reference}. Reason: {reason}");
+        await _context.SaveChangesAsync();
+
+        if (original.ReversalRequestedByUserId.HasValue)
+            await _notificationService.NotifyUserAsync(original.ReversalRequestedByUserId.Value, "Reversal Rejected",
+                $"Your reversal request for {original.Reference} was rejected. Reason: {reason}", NotificationType.PendingApproval);
+
+        return Ok(new { message = "Reversal request rejected.", reason });
     }
 
     // ─── GET /api/cash/opening-balance/today ──────────────────────────────────
@@ -326,6 +412,7 @@ public class CashController : BaseApiController
 
     // ─── POST /api/cash/reconcile ─────────────────────────────────────────────
     [HttpPost("reconcile")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> Reconcile([FromBody] ReconcileCashDto request)
     {
         var userId            = GetCurrentUserId();

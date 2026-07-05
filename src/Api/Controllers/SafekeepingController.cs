@@ -99,6 +99,7 @@ public class SafekeepingController : BaseApiController
 
     // ─── POST /api/safekeeping/account ────────────────────────────────────────
     [HttpPost("account")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> CreateAccount([FromBody] CreateSafekeepingAccountDto request)
     {
         if (string.IsNullOrWhiteSpace(request.DepositorName))
@@ -119,6 +120,7 @@ public class SafekeepingController : BaseApiController
 
     // ─── POST /api/safekeeping/accounts/{id}/deposit (auto-approved) ──────────
     [HttpPost("accounts/{id:int}/deposit")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> Deposit(int id, [FromBody] SafekeepingMovementDto request)
     {
         if (request.Amount <= 0) return BadRequest(new { message = "Amount must be greater than zero." });
@@ -145,6 +147,7 @@ public class SafekeepingController : BaseApiController
 
     // ─── POST /api/safekeeping/accounts/{id}/withdraw (MAKER → pending) ───────
     [HttpPost("accounts/{id:int}/withdraw")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> Withdraw(int id, [FromBody] SafekeepingMovementDto request)
     {
         if (request.Amount <= 0) return BadRequest(new { message = "Amount must be greater than zero." });

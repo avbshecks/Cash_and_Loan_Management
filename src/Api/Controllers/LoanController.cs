@@ -76,6 +76,7 @@ public class LoanController : BaseApiController
     }
 
     [HttpPost("borrower")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> CreateBorrower([FromBody] CreateBorrowerDto request)
     {
         if (await _context.Borrowers.AnyAsync(b => b.NationalId == request.NationalId))
@@ -97,6 +98,7 @@ public class LoanController : BaseApiController
     }
 
     [HttpPut("borrowers/{id:int}")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> UpdateBorrower(int id, [FromBody] UpdateBorrowerDto request)
     {
         var borrower = await _context.Borrowers.FindAsync(id);
@@ -215,7 +217,7 @@ public class LoanController : BaseApiController
     /// due by end of today. Repaid in the evening via the normal repayment flow.
     /// </summary>
     [HttpPost("day-loan")]
-    [Authorize(Roles = "Admin,Manager,Finance Officer,Cashier")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> CreateDayLoan([FromBody] CreateDayLoanDto request)
     {
         var borrower = await _context.Borrowers.FindAsync(request.BorrowerId);
@@ -276,6 +278,7 @@ public class LoanController : BaseApiController
     }
 
     [HttpPost("create")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> CreateLoan([FromBody] CreateLoanDto request)
     {
         var borrower = await _context.Borrowers.FindAsync(request.BorrowerId);
@@ -327,6 +330,7 @@ public class LoanController : BaseApiController
 
     // ─── APPROVE: Pending → Approved (MAKER-CHECKER step 1) ──────────────────
     [HttpPost("approve/{id:int}")]
+    [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> ApproveLoan(int id, [FromBody] string comment)
     {
         var loan = await _context.Loans.Include(l => l.Borrower).FirstOrDefaultAsync(l => l.Id == id);
@@ -361,6 +365,7 @@ public class LoanController : BaseApiController
 
     // ─── DISBURSE: Approved → Active (MAKER-CHECKER step 2) ──────────────────
     [HttpPost("disburse/{id:int}")]
+    [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> DisburseLoan(int id)
     {
         var loan = await _context.Loans.Include(l => l.Borrower).FirstOrDefaultAsync(l => l.Id == id);
@@ -407,6 +412,7 @@ public class LoanController : BaseApiController
 
     // ─── REJECT: Pending → Defaulted ─────────────────────────────────────────
     [HttpPost("reject/{id:int}")]
+    [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> RejectLoan(int id, [FromBody] string comment)
     {
         var loan = await _context.Loans.Include(l => l.Borrower).FirstOrDefaultAsync(l => l.Id == id);
@@ -437,6 +443,7 @@ public class LoanController : BaseApiController
 
     // ─── REPAYMENT ────────────────────────────────────────────────────────────
     [HttpPost("repayment")]
+    [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> CaptureRepayment([FromBody] CaptureRepaymentDto request)
     {
         var loan = await _context.Loans
