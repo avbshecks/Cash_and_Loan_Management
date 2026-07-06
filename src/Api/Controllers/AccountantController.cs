@@ -353,8 +353,8 @@ public class AccountantController : BaseApiController
         var (dayStart, dayEnd, _, _) = ResolveRange(period, date, from, to);
         var txns = await DayTransactionsAsync(dayStart, dayEnd);
         var opening = await BalanceBeforeAsync(dayStart);
-        var added     = txns.Where(t => IsPosted(t.ApprovalStatus) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
-        var disbursed = txns.Where(t => IsPosted(t.ApprovalStatus) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var added     = txns.Where(t => (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
+        var disbursed = txns.Where(t => (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
 
         return Ok(new
         {
@@ -385,12 +385,12 @@ public class AccountantController : BaseApiController
         var (dayStart, dayEnd, label, slug) = ResolveRange(period, date, from, to);
         var txns = await DayTransactionsAsync(dayStart, dayEnd);
         var opening   = await BalanceBeforeAsync(dayStart);
-        var added     = txns.Where(t => IsPosted(t.ApprovalStatus) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
-        var disbursed = txns.Where(t => IsPosted(t.ApprovalStatus) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var added     = txns.Where(t => (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
+        var disbursed = txns.Where(t => (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
         var closing   = opening + added - disbursed;
 
         // Exclude pending/rejected entries from the posted DR/CR ledger export
-        txns = txns.Where(t => IsPosted(t.ApprovalStatus)).ToList();
+        txns = txns.Where(t => (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
 
         var periodName = from != null && to != null ? "Range" : char.ToUpper(period[0]) + period[1..].ToLower();
         var title    = $"Accountant Cash Report — {label}";

@@ -72,7 +72,7 @@ public class SafekeepingController : BaseApiController
         decimal running = 0;
         var statement = ordered.Select(t =>
         {
-            var counts = IsPosted(t.ApprovalStatus);
+            var counts = (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved);
             if (counts) running += t.Type == SafekeepingTransactionType.Deposit ? t.Amount : -t.Amount;
             return new
             {
@@ -84,8 +84,8 @@ public class SafekeepingController : BaseApiController
             };
         }).ToList();
 
-        var approvedDeposits    = ordered.Where(t => t.Type == SafekeepingTransactionType.Deposit    && IsPosted(t.ApprovalStatus)).ToList();
-        var approvedWithdrawals = ordered.Where(t => t.Type == SafekeepingTransactionType.Withdrawal && IsPosted(t.ApprovalStatus)).ToList();
+        var approvedDeposits    = ordered.Where(t => t.Type == SafekeepingTransactionType.Deposit    && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
+        var approvedWithdrawals = ordered.Where(t => t.Type == SafekeepingTransactionType.Withdrawal && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
 
         return Ok(new
         {
@@ -284,8 +284,8 @@ public class SafekeepingController : BaseApiController
 
         var data = accounts.Select(a =>
         {
-            var deposits  = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Deposit    && IsPosted(t.ApprovalStatus)).ToList();
-            var collected = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Withdrawal && IsPosted(t.ApprovalStatus)).ToList();
+            var deposits  = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Deposit    && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
+            var collected = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Withdrawal && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
             return new
             {
                 a.DepositorName, a.Phone,
@@ -366,8 +366,8 @@ public class SafekeepingController : BaseApiController
             .OrderBy(t => t.Date)
             .ToListAsync();
 
-        var deposits  = txns.Where(t => t.Type == SafekeepingTransactionType.Deposit    && IsPosted(t.ApprovalStatus)).Sum(t => t.Amount);
-        var collected = txns.Where(t => t.Type == SafekeepingTransactionType.Withdrawal && IsPosted(t.ApprovalStatus)).Sum(t => t.Amount);
+        var deposits  = txns.Where(t => t.Type == SafekeepingTransactionType.Deposit    && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).Sum(t => t.Amount);
+        var collected = txns.Where(t => t.Type == SafekeepingTransactionType.Withdrawal && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).Sum(t => t.Amount);
 
         // Total currently held across all accounts
         var allDeposits = await _context.SafekeepingTransactions
@@ -436,12 +436,12 @@ public class SafekeepingController : BaseApiController
         decimal running = 0;
         var lines = ordered.Select(t =>
         {
-            var counts = IsPosted(t.ApprovalStatus);
+            var counts = (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved);
             if (counts) running += t.Type == SafekeepingTransactionType.Deposit ? t.Amount : -t.Amount;
             return (Txn: t, Counts: counts, BalanceAfter: running);
         }).ToList();
 
-        var deposits = ordered.Where(t => t.Type == SafekeepingTransactionType.Deposit && IsPosted(t.ApprovalStatus)).ToList();
+        var deposits = ordered.Where(t => t.Type == SafekeepingTransactionType.Deposit && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
         var title    = $"Safekeeping Statement — {account.DepositorName}";
         var fileName = $"CALM_Safekeeping_{account.DepositorName.Replace(' ', '_')}_{DateTime.UtcNow:yyyyMMdd}";
         var summary  = new List<(string, string)>

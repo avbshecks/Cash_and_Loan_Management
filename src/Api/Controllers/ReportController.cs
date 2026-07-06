@@ -29,24 +29,24 @@ public class ReportController : BaseApiController
         var dayEnd   = DateTime.SpecifyKind(rawDate.Date.AddDays(1), DateTimeKind.Utc);
 
         var explicitOpening = await _context.CashTransactions
-            .Where(t => t.Type == TransactionType.OpeningBalance && t.Date >= dayStart && t.Date < dayEnd && IsPosted(t.ApprovalStatus))
+            .Where(t => t.Type == TransactionType.OpeningBalance && t.Date >= dayStart && t.Date < dayEnd && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
 
         var additions = await _context.CashTransactions
-            .Where(t => t.Type == TransactionType.Addition && t.Date >= dayStart && t.Date < dayEnd && IsPosted(t.ApprovalStatus))
+            .Where(t => t.Type == TransactionType.Addition && t.Date >= dayStart && t.Date < dayEnd && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
 
         var disbursements = await _context.CashTransactions
-            .Where(t => t.Type == TransactionType.Disbursement && t.Date >= dayStart && t.Date < dayEnd && IsPosted(t.ApprovalStatus))
+            .Where(t => t.Type == TransactionType.Disbursement && t.Date >= dayStart && t.Date < dayEnd && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
 
         var prevCredits = await _context.CashTransactions
             .Where(t => (t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition)
-                        && t.Date < dayStart && IsPosted(t.ApprovalStatus))
+                        && t.Date < dayStart && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
 
         var prevDisbursements = await _context.CashTransactions
-            .Where(t => t.Type == TransactionType.Disbursement && t.Date < dayStart && IsPosted(t.ApprovalStatus))
+            .Where(t => t.Type == TransactionType.Disbursement && t.Date < dayStart && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
 
         var openingBalance = explicitOpening > 0 ? explicitOpening : prevCredits - prevDisbursements;
@@ -115,7 +115,7 @@ public class ReportController : BaseApiController
             var d = firstDay.AddDays(i); // stays Utc
             // Compare in-memory using local date string to avoid Kind mismatch
             var dStr = d.ToString("yyyy-MM-dd");
-            var dayTxns = txns.Where(t => t.Date.ToString("yyyy-MM-dd") == dStr && IsPosted(t.ApprovalStatus)).ToList();
+            var dayTxns = txns.Where(t => t.Date.ToString("yyyy-MM-dd") == dStr && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
             var adds = dayTxns.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
             var disb = dayTxns.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
             return new
@@ -129,8 +129,8 @@ public class ReportController : BaseApiController
             };
         }).Where(d => d.txnCount > 0).ToList();
 
-        var totalAdditions    = txns.Where(t => IsPosted(t.ApprovalStatus) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
-        var totalDisbursements = txns.Where(t => IsPosted(t.ApprovalStatus) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var totalAdditions    = txns.Where(t => (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
+        var totalDisbursements = txns.Where(t => (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
 
         // Monthly loan activity
         var newLoans = await _context.Loans
@@ -174,7 +174,7 @@ public class ReportController : BaseApiController
         {
             var d    = weekStart.AddDays(i);
             var dStr = d.ToString("yyyy-MM-dd");
-            var dayTxns = txns.Where(t => t.Date.ToString("yyyy-MM-dd") == dStr && IsPosted(t.ApprovalStatus)).ToList();
+            var dayTxns = txns.Where(t => t.Date.ToString("yyyy-MM-dd") == dStr && (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
             var adds = dayTxns.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
             var disb = dayTxns.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
             return new
@@ -185,8 +185,8 @@ public class ReportController : BaseApiController
             };
         }).Where(d => d.txnCount > 0).ToList();
 
-        var totalAdditions     = txns.Where(t => IsPosted(t.ApprovalStatus) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
-        var totalDisbursements = txns.Where(t => IsPosted(t.ApprovalStatus) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var totalAdditions     = txns.Where(t => (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
+        var totalDisbursements = txns.Where(t => (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
         var newLoans   = await _context.Loans.CountAsync(l => l.CreatedAt >= weekStart && l.CreatedAt < weekEnd);
         var repayments = await _context.LoanRepayments
             .Where(r => r.RepaymentDate >= weekStart && r.RepaymentDate < weekEnd && r.ApprovalStatus == CashApprovalStatus.Approved)
@@ -228,14 +228,14 @@ public class ReportController : BaseApiController
         {
             var d    = start.AddDays(i);
             var dStr = d.ToString("yyyy-MM-dd");
-            var dayTxns = txns.Where(x => x.Date.ToString("yyyy-MM-dd") == dStr && IsPosted(x.ApprovalStatus)).ToList();
+            var dayTxns = txns.Where(x => x.Date.ToString("yyyy-MM-dd") == dStr && (x.ApprovalStatus == CashApprovalStatus.AutoApproved || x.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
             var adds = dayTxns.Where(x => x.Type == TransactionType.Addition || x.Type == TransactionType.OpeningBalance).Sum(x => x.Amount);
             var disb = dayTxns.Where(x => x.Type == TransactionType.Disbursement).Sum(x => x.Amount);
             return new { date = dStr, dayOfWeek = d.DayOfWeek.ToString(), additions = adds, disbursements = disb, net = adds - disb, txnCount = dayTxns.Count };
         }).Where(d => d.txnCount > 0).ToList();
 
-        var totalAdditions     = txns.Where(x => IsPosted(x.ApprovalStatus) && (x.Type == TransactionType.Addition || x.Type == TransactionType.OpeningBalance)).Sum(x => x.Amount);
-        var totalDisbursements = txns.Where(x => IsPosted(x.ApprovalStatus) && x.Type == TransactionType.Disbursement).Sum(x => x.Amount);
+        var totalAdditions     = txns.Where(x => (x.ApprovalStatus == CashApprovalStatus.AutoApproved || x.ApprovalStatus == CashApprovalStatus.Approved) && (x.Type == TransactionType.Addition || x.Type == TransactionType.OpeningBalance)).Sum(x => x.Amount);
+        var totalDisbursements = txns.Where(x => (x.ApprovalStatus == CashApprovalStatus.AutoApproved || x.ApprovalStatus == CashApprovalStatus.Approved) && x.Type == TransactionType.Disbursement).Sum(x => x.Amount);
         var newLoans   = await _context.Loans.CountAsync(l => l.CreatedAt >= start && l.CreatedAt < end);
         var repayments = await _context.LoanRepayments
             .Where(r => r.RepaymentDate >= start && r.RepaymentDate < end && r.ApprovalStatus == CashApprovalStatus.Approved)
