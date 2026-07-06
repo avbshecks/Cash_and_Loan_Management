@@ -10,11 +10,18 @@ using CashLoanManagement.Infrastructure.Persistence;
 
 namespace CashLoanManagement.Api.Controllers;
 
+/// <summary>
+/// Safekeeping (custody) is full maker-checker: BOTH deposits ("leave money")
+/// and withdrawals ("collect money") are Pending until a Manager/Admin approves
+/// them. The balance only changes on approval.
+/// </summary>
 [Authorize]
 public class SafekeepingController : BaseApiController
 {
     private readonly CashLoanDbContext _context;
     private readonly INotificationService _notificationService;
+
+    private static bool IsPosted(CashApprovalStatus s) => s == CashApprovalStatus.AutoApproved || s == CashApprovalStatus.Approved;
 
     public SafekeepingController(CashLoanDbContext context, INotificationService notificationService)
     {
@@ -32,13 +39,15 @@ public class SafekeepingController : BaseApiController
             .Select(a => new
             {
                 a.Id, a.DepositorName, a.Phone, a.NationalId, a.IsActive, a.CreatedAt,
-                // Balance counts deposits and only APPROVED withdrawals
-                balance = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Deposit).Sum(t => t.Amount)
+                balance = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Deposit &&
+                              (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).Sum(t => t.Amount)
                         - a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Withdrawal &&
                               (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).Sum(t => t.Amount),
-                totalDeposited = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Deposit).Sum(t => t.Amount),
+                totalDeposited = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Deposit &&
+                              (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).Sum(t => t.Amount),
                 totalCollected = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Withdrawal &&
                               (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).Sum(t => t.Amount),
+                pendingDeposits    = a.Transactions.Count(t => t.Type == SafekeepingTransactionType.Deposit    && t.ApprovalStatus == CashApprovalStatus.Pending),
                 pendingWithdrawals = a.Transactions.Count(t => t.Type == SafekeepingTransactionType.Withdrawal && t.ApprovalStatus == CashApprovalStatus.Pending),
                 lastActivity = a.Transactions.Max(t => (DateTime?)t.Date)
             })
@@ -58,14 +67,12 @@ public class SafekeepingController : BaseApiController
 
         if (account == null) return NotFound(new { message = "Safekeeping account not found." });
 
-        // Running balance only moves on deposits and approved withdrawals
+        // Running balance only moves on APPROVED deposits and withdrawals
         var ordered = account.Transactions.OrderBy(t => t.Date).ToList();
         decimal running = 0;
         var statement = ordered.Select(t =>
         {
-            var counts = t.Type == SafekeepingTransactionType.Deposit
-                         || t.ApprovalStatus == CashApprovalStatus.AutoApproved
-                         || t.ApprovalStatus == CashApprovalStatus.Approved;
+            var counts = IsPosted(t.ApprovalStatus);
             if (counts) running += t.Type == SafekeepingTransactionType.Deposit ? t.Amount : -t.Amount;
             return new
             {
@@ -77,19 +84,19 @@ public class SafekeepingController : BaseApiController
             };
         }).ToList();
 
-        var deposits = ordered.Where(t => t.Type == SafekeepingTransactionType.Deposit).ToList();
-        var approvedWithdrawals = ordered.Where(t => t.Type == SafekeepingTransactionType.Withdrawal &&
-            (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
+        var approvedDeposits    = ordered.Where(t => t.Type == SafekeepingTransactionType.Deposit    && IsPosted(t.ApprovalStatus)).ToList();
+        var approvedWithdrawals = ordered.Where(t => t.Type == SafekeepingTransactionType.Withdrawal && IsPosted(t.ApprovalStatus)).ToList();
 
         return Ok(new
         {
             account.Id, account.DepositorName, account.Phone, account.NationalId,
             account.Notes, account.IsActive, account.CreatedAt,
             openedBy = account.CreatedByUser.FullName,
-            dateFirstLeft = deposits.Count > 0 ? deposits.First().Date : (DateTime?)null,
+            dateFirstLeft = approvedDeposits.Count > 0 ? approvedDeposits.First().Date : (DateTime?)null,
             lastCollection = approvedWithdrawals.Count > 0 ? approvedWithdrawals.Last().Date : (DateTime?)null,
-            totalDeposited = deposits.Sum(t => t.Amount),
+            totalDeposited = approvedDeposits.Sum(t => t.Amount),
             totalCollected = approvedWithdrawals.Sum(t => t.Amount),
+            pendingDeposits    = ordered.Count(t => t.Type == SafekeepingTransactionType.Deposit    && t.ApprovalStatus == CashApprovalStatus.Pending),
             pendingCollections = ordered.Count(t => t.Type == SafekeepingTransactionType.Withdrawal && t.ApprovalStatus == CashApprovalStatus.Pending),
             currentBalance = running,
             transactionCount = ordered.Count,
@@ -118,7 +125,8 @@ public class SafekeepingController : BaseApiController
         return Ok(new { message = "Safekeeping account created.", account.Id, account.DepositorName });
     }
 
-    // ─── POST /api/safekeeping/accounts/{id}/deposit (auto-approved) ──────────
+    // ─── POST /api/safekeeping/accounts/{id}/deposit (MAKER → pending) ────────
+    /// <summary>"Leave money" — now requires checker approval before it counts towards the balance.</summary>
     [HttpPost("accounts/{id:int}/deposit")]
     [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> Deposit(int id, [FromBody] SafekeepingMovementDto request)
@@ -135,17 +143,20 @@ public class SafekeepingController : BaseApiController
         {
             AccountId = id, Type = SafekeepingTransactionType.Deposit,
             Amount = request.Amount, Reference = reference, Notes = request.Notes,
-            Date = DateTime.UtcNow, ApprovalStatus = CashApprovalStatus.AutoApproved,
-            ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
+            Date = DateTime.UtcNow, ApprovalStatus = CashApprovalStatus.Pending,   // ← awaiting checker
             CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
         });
-        await LogAuditAsync($"Safekeeping deposit ${request.Amount:N2} for '{account.DepositorName}'. Ref: {reference}");
+        await LogAuditAsync($"Safekeeping deposit requested ${request.Amount:N2} for '{account.DepositorName}'. Ref: {reference}. AWAITING APPROVAL.");
         await _context.SaveChangesAsync();
 
-        return Ok(new { message = "Deposit recorded.", reference, balance = await ApprovedBalanceAsync(id) });
+        await _notificationService.NotifyRoleAsync("Manager", "Safekeeping Deposit Pending Approval",
+            $"${request.Amount:N2} deposit for {account.DepositorName} needs approval.", NotificationType.PendingApproval);
+
+        return Ok(new { message = "Deposit submitted for approval. It will reflect in the balance once a checker approves it.", reference, status = "PendingApproval" });
     }
 
     // ─── POST /api/safekeeping/accounts/{id}/withdraw (MAKER → pending) ───────
+    /// <summary>"Collect money" — requires checker approval before it counts towards the balance.</summary>
     [HttpPost("accounts/{id:int}/withdraw")]
     [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> Withdraw(int id, [FromBody] SafekeepingMovementDto request)
@@ -175,24 +186,24 @@ public class SafekeepingController : BaseApiController
 
         await _notificationService.NotifyRoleAsync("Manager", "Safekeeping Withdrawal Pending Approval",
             $"${request.Amount:N2} collection for {account.DepositorName} needs approval.", NotificationType.PendingApproval);
-        await _notificationService.NotifyRoleAsync("Finance Officer", "Safekeeping Withdrawal Pending Approval",
-            $"${request.Amount:N2} collection for {account.DepositorName} needs approval.", NotificationType.PendingApproval);
 
         return Ok(new { message = "Collection submitted for approval. The depositor can be paid once a checker approves it.", reference, status = "PendingApproval" });
     }
 
     // ─── GET /api/safekeeping/pending (CHECKER) ───────────────────────────────
+    /// <summary>Pending deposits AND withdrawals awaiting checker approval.</summary>
     [HttpGet("pending")]
     public async Task<IActionResult> GetPendingWithdrawals()
     {
         var pending = await _context.SafekeepingTransactions
             .Include(t => t.Account)
             .Include(t => t.CreatedByUser)
-            .Where(t => t.Type == SafekeepingTransactionType.Withdrawal && t.ApprovalStatus == CashApprovalStatus.Pending)
+            .Where(t => t.ApprovalStatus == CashApprovalStatus.Pending)
             .OrderBy(t => t.Date)
             .Select(t => new
             {
                 t.Id, t.Date, t.Amount, t.Reference, t.Notes,
+                type = t.Type.ToString(),
                 accountId = t.AccountId,
                 depositorName = t.Account.DepositorName,
                 requestedBy = t.CreatedByUser.FullName
@@ -202,21 +213,23 @@ public class SafekeepingController : BaseApiController
     }
 
     // ─── POST /api/safekeeping/withdrawals/{id}/approve (CHECKER) ─────────────
+    /// <summary>Approves a pending deposit OR withdrawal — this is when the balance actually changes.</summary>
     [HttpPost("withdrawals/{id:int}/approve")]
     [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> ApproveWithdrawal(int id)
     {
         var txn = await _context.SafekeepingTransactions.Include(t => t.Account).FirstOrDefaultAsync(t => t.Id == id);
-        if (txn == null) return NotFound(new { message = "Withdrawal not found." });
-        if (txn.Type != SafekeepingTransactionType.Withdrawal)
-            return BadRequest(new { message = "Only withdrawals require approval." });
+        if (txn == null) return NotFound(new { message = "Transaction not found." });
         if (txn.ApprovalStatus != CashApprovalStatus.Pending)
-            return BadRequest(new { message = $"Withdrawal is not pending. Status: {txn.ApprovalStatus}." });
+            return BadRequest(new { message = $"Transaction is not pending. Status: {txn.ApprovalStatus}." });
 
-        // Re-check funds (other approvals may have reduced the balance)
-        var approved = await ApprovedBalanceAsync(txn.AccountId);
-        if (txn.Amount > approved)
-            return BadRequest(new { message = $"Insufficient balance to approve. Available ${approved:N2}, required ${txn.Amount:N2}." });
+        // Re-check funds for withdrawals only (other approvals may have reduced the balance)
+        if (txn.Type == SafekeepingTransactionType.Withdrawal)
+        {
+            var approved = await ApprovedBalanceAsync(txn.AccountId);
+            if (txn.Amount > approved)
+                return BadRequest(new { message = $"Insufficient balance to approve. Available ${approved:N2}, required ${txn.Amount:N2}." });
+        }
 
         var userId = GetCurrentUserId();
         txn.ApprovalStatus = CashApprovalStatus.Approved;
@@ -224,10 +237,14 @@ public class SafekeepingController : BaseApiController
         txn.ApprovedAt = DateTime.UtcNow;
         txn.UpdatedAt = DateTime.UtcNow;
 
-        await LogAuditAsync($"Safekeeping withdrawal APPROVED ${txn.Amount:N2} for '{txn.Account.DepositorName}'. Ref: {txn.Reference}");
+        var action = txn.Type == SafekeepingTransactionType.Deposit ? "deposit" : "withdrawal";
+        await LogAuditAsync($"Safekeeping {action} APPROVED ${txn.Amount:N2} for '{txn.Account.DepositorName}'. Ref: {txn.Reference}");
         await _context.SaveChangesAsync();
 
-        return Ok(new { message = "Withdrawal approved. Depositor can be paid.", balance = await ApprovedBalanceAsync(txn.AccountId) });
+        await _notificationService.NotifyUserAsync(txn.CreatedByUserId, $"Safekeeping {char.ToUpper(action[0])}{action[1..]} Approved",
+            $"The {action} of ${txn.Amount:N2} for {txn.Account.DepositorName} has been approved.", NotificationType.PendingApproval);
+
+        return Ok(new { message = $"{char.ToUpper(action[0])}{action[1..]} approved.", balance = await ApprovedBalanceAsync(txn.AccountId) });
     }
 
     // ─── POST /api/safekeeping/withdrawals/{id}/reject (CHECKER) ──────────────
@@ -236,9 +253,9 @@ public class SafekeepingController : BaseApiController
     public async Task<IActionResult> RejectWithdrawal(int id, [FromBody] string reason)
     {
         var txn = await _context.SafekeepingTransactions.Include(t => t.Account).FirstOrDefaultAsync(t => t.Id == id);
-        if (txn == null) return NotFound(new { message = "Withdrawal not found." });
+        if (txn == null) return NotFound(new { message = "Transaction not found." });
         if (txn.ApprovalStatus != CashApprovalStatus.Pending)
-            return BadRequest(new { message = "Withdrawal is not pending." });
+            return BadRequest(new { message = "Transaction is not pending." });
 
         var userId = GetCurrentUserId();
         txn.ApprovalStatus = CashApprovalStatus.Rejected;
@@ -246,13 +263,14 @@ public class SafekeepingController : BaseApiController
         txn.ApprovedByUserId = userId;
         txn.UpdatedAt = DateTime.UtcNow;
 
-        await LogAuditAsync($"Safekeeping withdrawal REJECTED ${txn.Amount:N2} for '{txn.Account.DepositorName}'. Reason: {reason}");
+        var action = txn.Type == SafekeepingTransactionType.Deposit ? "deposit" : "withdrawal";
+        await LogAuditAsync($"Safekeeping {action} REJECTED ${txn.Amount:N2} for '{txn.Account.DepositorName}'. Reason: {reason}");
         await _context.SaveChangesAsync();
 
-        await _notificationService.NotifyUserAsync(txn.CreatedByUserId, "Safekeeping Withdrawal Rejected",
-            $"Collection of ${txn.Amount:N2} for {txn.Account.DepositorName} was rejected. Reason: {reason}", NotificationType.PendingApproval);
+        await _notificationService.NotifyUserAsync(txn.CreatedByUserId, $"Safekeeping {char.ToUpper(action[0])}{action[1..]} Rejected",
+            $"The {action} of ${txn.Amount:N2} for {txn.Account.DepositorName} was rejected. Reason: {reason}", NotificationType.PendingApproval);
 
-        return Ok(new { message = "Withdrawal rejected.", reason });
+        return Ok(new { message = $"{char.ToUpper(action[0])}{action[1..]} rejected.", reason });
     }
 
     // ─── GET /api/safekeeping/report/export (all accounts, xlsx/pdf) ──────────
@@ -266,9 +284,8 @@ public class SafekeepingController : BaseApiController
 
         var data = accounts.Select(a =>
         {
-            var deposits = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Deposit).ToList();
-            var collected = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Withdrawal &&
-                (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).ToList();
+            var deposits  = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Deposit    && IsPosted(t.ApprovalStatus)).ToList();
+            var collected = a.Transactions.Where(t => t.Type == SafekeepingTransactionType.Withdrawal && IsPosted(t.ApprovalStatus)).ToList();
             return new
             {
                 a.DepositorName, a.Phone,
@@ -349,35 +366,32 @@ public class SafekeepingController : BaseApiController
             .OrderBy(t => t.Date)
             .ToListAsync();
 
-        var deposits = txns.Where(t => t.Type == SafekeepingTransactionType.Deposit).Sum(t => t.Amount);
-        var collected = txns.Where(t => t.Type == SafekeepingTransactionType.Withdrawal &&
-            (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved)).Sum(t => t.Amount);
+        var deposits  = txns.Where(t => t.Type == SafekeepingTransactionType.Deposit    && IsPosted(t.ApprovalStatus)).Sum(t => t.Amount);
+        var collected = txns.Where(t => t.Type == SafekeepingTransactionType.Withdrawal && IsPosted(t.ApprovalStatus)).Sum(t => t.Amount);
 
         // Total currently held across all accounts
         var allDeposits = await _context.SafekeepingTransactions
-            .Where(t => t.Type == SafekeepingTransactionType.Deposit && t.Date < end)
+            .Where(t => t.Type == SafekeepingTransactionType.Deposit && t.Date < end &&
+                       (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
         var allCollected = await _context.SafekeepingTransactions
             .Where(t => t.Type == SafekeepingTransactionType.Withdrawal && t.Date < end &&
                        (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
 
-        var periodName = from != null && to != null ? "Range"
-            : string.Equals(period, "monthly", StringComparison.OrdinalIgnoreCase) ? "Monthly" : "Weekly";
         var title    = $"Safekeeping Report — {label}";
-        var fileName = $"CALM_Safekeeping_{periodName}_{slug}";
+        var fileName = $"CALM_Safekeeping_{(from != null && to != null ? "Range" : string.Equals(period, "monthly", StringComparison.OrdinalIgnoreCase) ? "Monthly" : "Weekly")}_{slug}";
 
         var summary = new List<(string, string)>
         {
-            ("Deposits (left)",       $"${deposits:N2}"),
-            ("Collections (approved)",$"${collected:N2}"),
-            ("Net Movement",          $"${deposits - collected:N2}"),
+            ("Deposits Approved",       $"${deposits:N2}"),
+            ("Collections Approved",    $"${collected:N2}"),
+            ("Net Movement",            $"${deposits - collected:N2}"),
             ("Total Held (period end)", $"${allDeposits - allCollected:N2}")
         };
         var headers = new[] { "Date", "Depositor", "Type", "Status", "Amount", "Reference", "By" };
 
         string StatusOf(SafekeepingTransaction t) =>
-            t.Type == SafekeepingTransactionType.Deposit ? "—" :
             t.ApprovalStatus == CashApprovalStatus.Pending ? "Pending" :
             t.ApprovalStatus == CashApprovalStatus.Rejected ? "Rejected" : "Approved";
 
@@ -422,14 +436,12 @@ public class SafekeepingController : BaseApiController
         decimal running = 0;
         var lines = ordered.Select(t =>
         {
-            var counts = t.Type == SafekeepingTransactionType.Deposit
-                         || t.ApprovalStatus == CashApprovalStatus.AutoApproved
-                         || t.ApprovalStatus == CashApprovalStatus.Approved;
+            var counts = IsPosted(t.ApprovalStatus);
             if (counts) running += t.Type == SafekeepingTransactionType.Deposit ? t.Amount : -t.Amount;
             return (Txn: t, Counts: counts, BalanceAfter: running);
         }).ToList();
 
-        var deposits = ordered.Where(t => t.Type == SafekeepingTransactionType.Deposit).ToList();
+        var deposits = ordered.Where(t => t.Type == SafekeepingTransactionType.Deposit && IsPosted(t.ApprovalStatus)).ToList();
         var title    = $"Safekeeping Statement — {account.DepositorName}";
         var fileName = $"CALM_Safekeeping_{account.DepositorName.Replace(' ', '_')}_{DateTime.UtcNow:yyyyMMdd}";
         var summary  = new List<(string, string)>
@@ -442,15 +454,17 @@ public class SafekeepingController : BaseApiController
             ("Remaining Balance", $"${running:N2}")
         };
 
+        string StatusOf(SafekeepingTransaction t) =>
+            t.ApprovalStatus == CashApprovalStatus.Pending ? "Pending" :
+            t.ApprovalStatus == CashApprovalStatus.Rejected ? "Rejected" : "Approved";
+
         if (format.ToLower() == "pdf")
         {
             var rows = lines.Select(l => new[]
             {
                 l.Txn.Date.ToString("dd MMM yyyy HH:mm"),
                 l.Txn.Type == SafekeepingTransactionType.Deposit ? "Left" : "Collected",
-                l.Txn.Type == SafekeepingTransactionType.Deposit ? "—" :
-                    l.Txn.ApprovalStatus == CashApprovalStatus.Pending ? "Pending" :
-                    l.Txn.ApprovalStatus == CashApprovalStatus.Rejected ? "Rejected" : "Approved",
+                StatusOf(l.Txn),
                 l.Txn.Type == SafekeepingTransactionType.Deposit ? $"!g+${l.Txn.Amount:N2}" : $"!r-${l.Txn.Amount:N2}",
                 l.Counts ? $"${l.BalanceAfter:N2}" : "—",
                 l.Txn.Reference,
@@ -492,9 +506,7 @@ public class SafekeepingController : BaseApiController
             var isDeposit = l.Txn.Type == SafekeepingTransactionType.Deposit;
             ws.Cell(r, 1).Value = l.Txn.Date.ToLocalTime().ToString("dd MMM yyyy HH:mm");
             ws.Cell(r, 2).Value = isDeposit ? "Left" : "Collected";
-            ws.Cell(r, 3).Value = isDeposit ? "—" :
-                l.Txn.ApprovalStatus == CashApprovalStatus.Pending ? "Pending" :
-                l.Txn.ApprovalStatus == CashApprovalStatus.Rejected ? "Rejected" : "Approved";
+            ws.Cell(r, 3).Value = StatusOf(l.Txn);
             if (!isDeposit)
             {
                 ws.Cell(r, 4).Value = -l.Txn.Amount;
@@ -522,7 +534,8 @@ public class SafekeepingController : BaseApiController
     private async Task<decimal> ApprovedBalanceAsync(int accountId)
     {
         var deposits = await _context.SafekeepingTransactions
-            .Where(t => t.AccountId == accountId && t.Type == SafekeepingTransactionType.Deposit)
+            .Where(t => t.AccountId == accountId && t.Type == SafekeepingTransactionType.Deposit &&
+                       (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
         var withdrawals = await _context.SafekeepingTransactions
             .Where(t => t.AccountId == accountId && t.Type == SafekeepingTransactionType.Withdrawal &&

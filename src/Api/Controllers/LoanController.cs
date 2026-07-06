@@ -68,8 +68,8 @@ public class LoanController : BaseApiController
             {
                 l.Id, l.ReferenceNumber, l.Amount, l.Status, l.DueDate,
                 l.CreatedAt, l.ApprovedAt, l.DisbursedAt,
-                totalRepaid      = l.Repayments.Sum(r => r.Amount),
-                remainingBalance = l.Amount - l.Repayments.Sum(r => r.Amount),
+                totalRepaid      = l.Repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Approved).Sum(r => r.Amount),
+                remainingBalance = l.Amount - l.Repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Approved).Sum(r => r.Amount),
                 createdBy        = l.CreatedByUser.FullName
             })
         });
@@ -164,8 +164,8 @@ public class LoanController : BaseApiController
             {
                 l.Id, l.ReferenceNumber, l.Amount, l.RepaymentTerms,
                 l.DueDate, l.Status, l.CreatedAt, l.ApprovedAt, l.DisbursedAt,
-                TotalRepaid      = l.Repayments.Sum(r => r.Amount),
-                RemainingBalance = l.Amount - l.Repayments.Sum(r => r.Amount),
+                TotalRepaid      = l.Repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Approved).Sum(r => r.Amount),
+                RemainingBalance = l.Amount - l.Repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Approved).Sum(r => r.Amount),
                 Borrower   = new { l.Borrower.Id, l.Borrower.FullName, l.Borrower.NationalId, l.Borrower.Phone },
                 CreatedBy  = l.CreatedByUser.FullName,
                 ApprovedBy = l.ApprovedByUser != null ? l.ApprovedByUser.FullName : null
@@ -187,7 +187,7 @@ public class LoanController : BaseApiController
 
         if (loan == null) return NotFound(new { message = "Loan not found." });
 
-        var totalRepaid = loan.Repayments.Sum(r => r.Amount);
+        var totalRepaid = loan.Repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Approved).Sum(r => r.Amount);
         var remaining   = loan.Amount - totalRepaid;
         var daysOverdue = loan.Status == LoanStatus.Overdue
             ? (int)(DateTime.UtcNow.Date - loan.DueDate.Date).TotalDays : 0;
@@ -206,6 +206,7 @@ public class LoanController : BaseApiController
                 .Select(r => new
                 {
                     r.Id, r.Amount, r.RepaymentDate, r.Reference,
+                    status = r.ApprovalStatus.ToString(),
                     capturedBy = r.CapturedByUser.FullName
                 })
         });
@@ -441,7 +442,9 @@ public class LoanController : BaseApiController
         return Ok(new { message = $"Loan {loan.ReferenceNumber} rejected." });
     }
 
-    // ─── REPAYMENT ────────────────────────────────────────────────────────────
+    // ─── REPAYMENT (MAKER → pending) ──────────────────────────────────────────
+    /// <summary>Repayments require checker approval — the cash receipt is only posted and
+    /// the loan status only updates once a Manager/Admin approves.</summary>
     [HttpPost("repayment")]
     [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> CaptureRepayment([FromBody] CaptureRepaymentDto request)
@@ -457,11 +460,12 @@ public class LoanController : BaseApiController
         if (request.Amount <= 0)
             return BadRequest(new { message = "Repayment amount must be greater than zero." });
 
-        var totalRepaid = loan.Repayments.Sum(r => r.Amount);
-        var remaining   = loan.Amount - totalRepaid;
+        var approvedRepaid = loan.Repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Approved).Sum(r => r.Amount);
+        var pendingRepaid   = loan.Repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Pending).Sum(r => r.Amount);
+        var remaining       = loan.Amount - approvedRepaid - pendingRepaid;
 
         if (request.Amount > remaining)
-            return BadRequest(new { message = $"Amount ${request.Amount:N2} exceeds remaining balance ${remaining:N2}." });
+            return BadRequest(new { message = $"Amount ${request.Amount:N2} exceeds remaining balance ${remaining:N2} (after pending repayments)." });
 
         var userId = GetCurrentUserId();
 
@@ -475,31 +479,89 @@ public class LoanController : BaseApiController
         var repayment = new LoanRepayment
         {
             LoanId = loan.Id, Amount = request.Amount,
-            Reference = reference,
+            Reference = reference, ApprovalStatus = CashApprovalStatus.Pending,
             RepaymentDate = DateTime.UtcNow, CapturedByUserId = userId, CreatedAt = DateTime.UtcNow
         };
         _context.LoanRepayments.Add(repayment);
 
-        // Add cash receipt for the repayment
+        await LogAuditAsync(userId, $"Repayment ${request.Amount:N2} requested for loan {loan.ReferenceNumber} ({loan.Borrower.FullName}). AWAITING APPROVAL.");
+        await _context.SaveChangesAsync();
+
+        await _notificationService.NotifyRoleAsync("Manager", "Loan Repayment Pending Approval",
+            $"${request.Amount:N2} repayment for {loan.ReferenceNumber} ({loan.Borrower.FullName}) needs approval.", NotificationType.PendingApproval);
+
+        return Ok(new
+        {
+            message = "Repayment submitted for approval. It will reflect once a checker approves it.",
+            loanReference = loan.ReferenceNumber,
+            reference,
+            status = "PendingApproval"
+        });
+    }
+
+    // ─── APPROVE REPAYMENT (CHECKER) ──────────────────────────────────────────
+    [HttpGet("pending-repayments")]
+    public async Task<IActionResult> GetPendingRepayments()
+    {
+        var pending = await _context.LoanRepayments
+            .Include(r => r.Loan).ThenInclude(l => l.Borrower)
+            .Include(r => r.CapturedByUser)
+            .Where(r => r.ApprovalStatus == CashApprovalStatus.Pending)
+            .OrderBy(r => r.RepaymentDate)
+            .Select(r => new
+            {
+                r.Id, r.Amount, r.Reference, r.RepaymentDate,
+                loanId = r.LoanId, loanReference = r.Loan.ReferenceNumber,
+                borrowerName = r.Loan.Borrower.FullName,
+                requestedBy = r.CapturedByUser.FullName
+            })
+            .ToListAsync();
+        return Ok(pending);
+    }
+
+    [HttpPost("repayment/{id:int}/approve")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> ApproveRepayment(int id)
+    {
+        var repayment = await _context.LoanRepayments
+            .Include(r => r.Loan).ThenInclude(l => l.Borrower)
+            .Include(r => r.Loan).ThenInclude(l => l.Repayments)
+            .FirstOrDefaultAsync(r => r.Id == id);
+        if (repayment == null) return NotFound(new { message = "Repayment not found." });
+        if (repayment.ApprovalStatus != CashApprovalStatus.Pending)
+            return BadRequest(new { message = $"Repayment is not pending. Status: {repayment.ApprovalStatus}." });
+
+        var userId = GetCurrentUserId();
+        var loan = repayment.Loan;
+
+        repayment.ApprovalStatus = CashApprovalStatus.Approved;
+        repayment.ApprovedByUserId = userId;
+        repayment.ApprovedAt = DateTime.UtcNow;
+        repayment.UpdatedAt = DateTime.UtcNow;
+
         _context.CashTransactions.Add(new CashTransaction
         {
-            Amount = request.Amount, Type = TransactionType.Addition,
+            Amount = repayment.Amount, Type = TransactionType.Addition,
             SourceOrPurpose = $"Loan repayment — {loan.Borrower.FullName} ({loan.ReferenceNumber})",
             Reference = repayment.Reference, Date = DateTime.UtcNow,
-            ApprovalStatus = CashApprovalStatus.AutoApproved,
+            ApprovalStatus = CashApprovalStatus.Approved,
             ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
             CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
         });
 
-        var newRemaining = remaining - request.Amount;
+        var totalRepaid = loan.Repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Approved || r.Id == repayment.Id).Sum(r => r.Amount);
+        var newRemaining = loan.Amount - totalRepaid;
         if (newRemaining <= 0)
         {
             loan.Status    = LoanStatus.Paid;
             loan.UpdatedAt = DateTime.UtcNow;
         }
 
-        await LogAuditAsync(userId, $"Repayment ${request.Amount:N2} for loan {loan.ReferenceNumber} ({loan.Borrower.FullName}). Remaining: ${newRemaining:N2}");
+        await LogAuditAsync(userId, $"Repayment ${repayment.Amount:N2} for loan {loan.ReferenceNumber} ({loan.Borrower.FullName}) APPROVED. Remaining: ${newRemaining:N2}");
         await _context.SaveChangesAsync();
+
+        await _notificationService.NotifyUserAsync(repayment.CapturedByUserId, "Loan Repayment Approved",
+            $"The ${repayment.Amount:N2} repayment for {loan.ReferenceNumber} has been approved.", NotificationType.PendingApproval);
 
         if (loan.Status == LoanStatus.Paid)
             await _notificationService.NotifyRoleAsync("Manager", "Loan Fully Repaid",
@@ -507,15 +569,38 @@ public class LoanController : BaseApiController
 
         return Ok(new
         {
-            message       = "Repayment recorded.",
-            loanReference = loan.ReferenceNumber,
-            reference,
-            repaidAmount  = request.Amount,
+            message = "Repayment approved.",
             remainingBalance = newRemaining,
-            loanStatus    = newRemaining <= 0 ? "Paid" : loan.Status.ToString(),
-            totalRepaid   = totalRepaid + request.Amount,
-            repaymentProgress = Math.Round(((totalRepaid + request.Amount) / loan.Amount) * 100, 1)
+            loanStatus = loan.Status.ToString(),
+            totalRepaid,
+            repaymentProgress = loan.Amount > 0 ? Math.Round((totalRepaid / loan.Amount) * 100, 1) : 0
         });
+    }
+
+    [HttpPost("repayment/{id:int}/reject")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> RejectRepayment(int id, [FromBody] string reason)
+    {
+        var repayment = await _context.LoanRepayments
+            .Include(r => r.Loan).ThenInclude(l => l.Borrower)
+            .FirstOrDefaultAsync(r => r.Id == id);
+        if (repayment == null) return NotFound(new { message = "Repayment not found." });
+        if (repayment.ApprovalStatus != CashApprovalStatus.Pending)
+            return BadRequest(new { message = "Repayment is not pending." });
+
+        var userId = GetCurrentUserId();
+        repayment.ApprovalStatus = CashApprovalStatus.Rejected;
+        repayment.RejectionReason = reason;
+        repayment.ApprovedByUserId = userId;
+        repayment.UpdatedAt = DateTime.UtcNow;
+
+        await LogAuditAsync(userId, $"Repayment ${repayment.Amount:N2} for loan {repayment.Loan.ReferenceNumber} REJECTED. Reason: {reason}");
+        await _context.SaveChangesAsync();
+
+        await _notificationService.NotifyUserAsync(repayment.CapturedByUserId, "Loan Repayment Rejected",
+            $"The ${repayment.Amount:N2} repayment for {repayment.Loan.ReferenceNumber} was rejected. Reason: {reason}", NotificationType.PendingApproval);
+
+        return Ok(new { message = "Repayment rejected.", reason });
     }
 
     // ─── MANUAL OVERDUE / BLACKLIST CHECK ─────────────────────────────────────
@@ -640,14 +725,17 @@ public class LoanController : BaseApiController
         if (loan == null) return NotFound(new { message = "Loan not found." });
 
         var repayments = loan.Repayments.OrderBy(r => r.RepaymentDate).ToList();
+        var approved   = repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Approved).ToList();
         decimal runningBalance = loan.Amount;
         var schedule = repayments.Select(r =>
         {
-            runningBalance -= r.Amount;
+            var counts = r.ApprovalStatus == CashApprovalStatus.Approved;
+            if (counts) runningBalance -= r.Amount;
             return new
             {
                 r.Id, r.RepaymentDate, r.Amount, r.Reference,
-                balanceAfter = runningBalance,
+                status = r.ApprovalStatus.ToString(),
+                balanceAfter = counts ? (decimal?)runningBalance : null,
                 capturedBy   = r.CapturedByUser.FullName
             };
         }).ToList();
@@ -657,8 +745,8 @@ public class LoanController : BaseApiController
             loan.Id, loan.ReferenceNumber, loan.Amount, loan.RepaymentTerms,
             loan.DueDate, loan.Status, loan.DisbursedAt,
             borrower         = new { loan.Borrower.FullName, loan.Borrower.NationalId, loan.Borrower.Phone },
-            totalRepaid      = repayments.Sum(r => r.Amount),
-            remainingBalance = loan.Amount - repayments.Sum(r => r.Amount),
+            totalRepaid      = approved.Sum(r => r.Amount),
+            remainingBalance = loan.Amount - approved.Sum(r => r.Amount),
             repaymentCount   = repayments.Count,
             schedule
         });

@@ -28,7 +28,8 @@ public class CashController : BaseApiController
     {
         var balance = await ComputeBalanceAsync();
         var pendingCount = await _context.CashTransactions
-            .CountAsync(t => t.Type == TransactionType.Disbursement && t.ApprovalStatus == CashApprovalStatus.Pending);
+            .CountAsync(t => (t.Type == TransactionType.Disbursement || t.Type == TransactionType.Addition)
+                             && t.ApprovalStatus == CashApprovalStatus.Pending);
         var initialized = await _context.CashTransactions.AnyAsync();
         return Ok(new { currentBalance = balance, currency = "USD", pendingDisbursements = pendingCount, initialized });
     }
@@ -67,7 +68,7 @@ public class CashController : BaseApiController
         return Ok(new { message = "Initial opening balance recorded.", openingBalance = request.Amount });
     }
 
-    // ─── POST /api/cash/add ───────────────────────────────────────────────────
+    // ─── POST /api/cash/add (MAKER — now requires checker approval) ───────────
     [HttpPost("add")]
     [Authorize(Roles = "Admin,Cashier")]
     public async Task<IActionResult> AddCash([FromBody] AddCashDto request)
@@ -76,18 +77,22 @@ public class CashController : BaseApiController
 
         var userId    = GetCurrentUserId();
         var reference = await NextReferenceAsync("ADD", TransactionType.Addition);
-        _context.CashTransactions.Add(new CashTransaction
+        var tx = new CashTransaction
         {
             Amount = request.Amount, Type = TransactionType.Addition,
             SourceOrPurpose = request.Source, Reference = reference,
-            Date = DateTime.UtcNow, ApprovalStatus = CashApprovalStatus.AutoApproved,
-            ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
+            Date = DateTime.UtcNow,
+            ApprovalStatus = CashApprovalStatus.Pending,   // ← awaiting checker; balance unaffected until approved
             CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
-        });
-        await LogAuditAsync(userId, $"Cash added: ${request.Amount:N2} from '{request.Source}'. Ref: {reference}");
+        };
+        _context.CashTransactions.Add(tx);
+        await LogAuditAsync(userId, $"Cash addition requested: ${request.Amount:N2} from '{request.Source}'. Ref: {reference}. AWAITING APPROVAL.");
         await _context.SaveChangesAsync();
 
-        return Ok(new { message = "Cash added successfully.", reference, newBalance = await ComputeBalanceAsync() });
+        await _notificationService.NotifyRoleAsync("Manager", "Cash Addition Pending Approval",
+            $"${request.Amount:N2} from '{request.Source}' needs your approval.", NotificationType.PendingApproval);
+
+        return Ok(new { message = "Cash addition recorded and sent for approval.", transactionId = tx.Id, reference, status = "PendingApproval" });
     }
 
     // ─── POST /api/cash/disburse (MAKER) ─────────────────────────────────────
@@ -126,16 +131,19 @@ public class CashController : BaseApiController
     }
 
     // ─── GET /api/cash/pending ─────────────────────────────────────────────── CHECKER
+    /// <summary>Pending cash additions AND disbursements awaiting checker approval.</summary>
     [HttpGet("pending")]
     public async Task<IActionResult> GetPendingDisbursements()
     {
         var pending = await _context.CashTransactions
             .Include(t => t.CreatedByUser)
-            .Where(t => t.Type == TransactionType.Disbursement && t.ApprovalStatus == CashApprovalStatus.Pending)
+            .Where(t => (t.Type == TransactionType.Disbursement || t.Type == TransactionType.Addition)
+                        && t.ApprovalStatus == CashApprovalStatus.Pending)
             .OrderBy(t => t.Date)
             .Select(t => new
             {
                 t.Id, t.Date, t.Amount, t.SourceOrPurpose, t.Reference,
+                type = t.Type.ToString(),
                 requestedBy = t.CreatedByUser.FullName,
                 t.ApprovalStatus
             })
@@ -153,15 +161,18 @@ public class CashController : BaseApiController
             .FirstOrDefaultAsync(t => t.Id == id);
 
         if (tx == null) return NotFound(new { message = "Transaction not found." });
-        if (tx.Type != TransactionType.Disbursement)
-            return BadRequest(new { message = "Only disbursements require approval." });
+        if (tx.Type != TransactionType.Disbursement && tx.Type != TransactionType.Addition)
+            return BadRequest(new { message = "Only additions and disbursements require approval." });
         if (tx.ApprovalStatus != CashApprovalStatus.Pending)
             return BadRequest(new { message = $"Transaction is not pending. Status: {tx.ApprovalStatus}." });
 
-        // Re-check balance (another disbursement may have reduced it since the request was made)
-        var currentBalance = await ComputeBalanceAsync();
-        if (tx.Amount > currentBalance)
-            return BadRequest(new { message = $"Insufficient balance to approve. Current: ${currentBalance:N2}, Required: ${tx.Amount:N2}." });
+        // Re-check balance for disbursements only (another one may have reduced it since the request was made)
+        if (tx.Type == TransactionType.Disbursement)
+        {
+            var currentBalance = await ComputeBalanceAsync();
+            if (tx.Amount > currentBalance)
+                return BadRequest(new { message = $"Insufficient balance to approve. Current: ${currentBalance:N2}, Required: ${tx.Amount:N2}." });
+        }
 
         var userId = GetCurrentUserId();
         tx.ApprovalStatus  = CashApprovalStatus.Approved;
@@ -169,16 +180,20 @@ public class CashController : BaseApiController
         tx.ApprovedAt       = DateTime.UtcNow;
         tx.UpdatedAt        = DateTime.UtcNow;
 
-        await LogAuditAsync(userId, $"Cash disbursement APPROVED: ${tx.Amount:N2} to '{tx.SourceOrPurpose}'. Ref: {tx.Reference}");
+        var action = tx.Type == TransactionType.Addition ? "addition" : "disbursement";
+        await LogAuditAsync(userId, $"Cash {action} APPROVED: ${tx.Amount:N2} — '{tx.SourceOrPurpose}'. Ref: {tx.Reference}");
         await _context.SaveChangesAsync();
 
         var newBalance = await ComputeBalanceAsync();
 
         if (newBalance < LowCashThreshold)
             await _notificationService.NotifyRoleAsync("Manager", "Low Cash Balance Alert",
-                $"Balance dropped to ${newBalance:N2} after approving disbursement.", NotificationType.LowCashBalance);
+                $"Balance dropped to ${newBalance:N2} after approving a {action}.", NotificationType.LowCashBalance);
 
-        return Ok(new { message = "Disbursement approved.", newBalance });
+        await _notificationService.NotifyUserAsync(tx.CreatedByUserId, $"Cash {char.ToUpper(action[0])}{action[1..]} Approved",
+            $"Your {action} of ${tx.Amount:N2} ({tx.Reference}) has been approved.", NotificationType.PendingApproval);
+
+        return Ok(new { message = $"Cash {action} approved.", newBalance });
     }
 
     // ─── POST /api/cash/reject/{id} ───────────────────────────────────────── CHECKER
@@ -199,14 +214,15 @@ public class CashController : BaseApiController
         tx.ApprovedByUserId = userId;
         tx.UpdatedAt        = DateTime.UtcNow;
 
-        await LogAuditAsync(userId, $"Cash disbursement REJECTED: ${tx.Amount:N2}. Reason: {reason}");
+        var action = tx.Type == TransactionType.Addition ? "addition" : "disbursement";
+        await LogAuditAsync(userId, $"Cash {action} REJECTED: ${tx.Amount:N2}. Reason: {reason}");
         await _context.SaveChangesAsync();
 
         // Notify originator
-        await _notificationService.NotifyUserAsync(tx.CreatedByUserId, "Disbursement Rejected",
-            $"Your disbursement of ${tx.Amount:N2} was rejected. Reason: {reason}", NotificationType.PendingApproval);
+        await _notificationService.NotifyUserAsync(tx.CreatedByUserId, $"Cash {char.ToUpper(action[0])}{action[1..]} Rejected",
+            $"Your {action} of ${tx.Amount:N2} was rejected. Reason: {reason}", NotificationType.PendingApproval);
 
-        return Ok(new { message = "Disbursement rejected.", reason });
+        return Ok(new { message = $"Cash {action} rejected.", reason });
     }
 
     // ─── GET /api/cash/transactions ───────────────────────────────────────────
@@ -440,10 +456,16 @@ public class CashController : BaseApiController
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
+    /// <summary>True for AutoApproved (legacy/opening balance) or checker-Approved entries — the only ones that count towards the balance.</summary>
+    private static bool IsPosted(CashApprovalStatus s) => s == CashApprovalStatus.AutoApproved || s == CashApprovalStatus.Approved;
+
     internal async Task<decimal> ComputeBalanceAsync()
     {
+        // Only count APPROVED additions and opening balances (Cash Add now requires checker approval too)
         var credits = await _context.CashTransactions
-            .Where(t => t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition)
+            .Where(t => (t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition) &&
+                       (t.ApprovalStatus == CashApprovalStatus.AutoApproved ||
+                        t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
 
         // Only count APPROVED disbursements (AutoApproved for legacy, Approved for new)
@@ -461,7 +483,9 @@ public class CashController : BaseApiController
     {
         var credits = await _context.CashTransactions
             .Where(t => (t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition)
-                        && t.Date < beforeUtc)
+                        && t.Date < beforeUtc &&
+                       (t.ApprovalStatus == CashApprovalStatus.AutoApproved ||
+                        t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
 
         var debits = await _context.CashTransactions

@@ -25,6 +25,8 @@ public class ReportExportController : ControllerBase
         _context = context;
     }
 
+    private static bool IsPosted(CashApprovalStatus s) => s == CashApprovalStatus.AutoApproved || s == CashApprovalStatus.Approved;
+
     // ─── GET /api/report/daily-cash/export ───────────────────────────────────
     [HttpGet("daily-cash/export")]
     public async Task<IActionResult> ExportDailyCash(
@@ -41,14 +43,14 @@ public class ReportExportController : ControllerBase
             .OrderBy(t => t.Date)
             .ToListAsync();
 
-        var opening = transactions.Where(t => t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
-        var adds    = transactions.Where(t => t.Type == TransactionType.Addition).Sum(t => t.Amount);
-        var disb    = transactions.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var opening = transactions.Where(t => t.Type == TransactionType.OpeningBalance && IsPosted(t.ApprovalStatus)).Sum(t => t.Amount);
+        var adds    = transactions.Where(t => t.Type == TransactionType.Addition && IsPosted(t.ApprovalStatus)).Sum(t => t.Amount);
+        var disb    = transactions.Where(t => t.Type == TransactionType.Disbursement && IsPosted(t.ApprovalStatus)).Sum(t => t.Amount);
         var prevCredits = await _context.CashTransactions
-            .Where(t => (t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition) && t.Date < dayStart)
+            .Where(t => (t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition) && t.Date < dayStart && IsPosted(t.ApprovalStatus))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
         var prevDisb = await _context.CashTransactions
-            .Where(t => t.Type == TransactionType.Disbursement && t.Date < dayStart)
+            .Where(t => t.Type == TransactionType.Disbursement && t.Date < dayStart && IsPosted(t.ApprovalStatus))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
         var openingBalance = opening > 0 ? opening : prevCredits - prevDisb;
         var closing = openingBalance + adds - disb;
@@ -99,7 +101,7 @@ public class ReportExportController : ControllerBase
             .ToListAsync();
 
         var repayments = await _context.LoanRepayments
-            .Where(r => r.RepaymentDate >= firstDay && r.RepaymentDate < lastDay)
+            .Where(r => r.RepaymentDate >= firstDay && r.RepaymentDate < lastDay && r.ApprovalStatus == CashApprovalStatus.Approved)
             .SumAsync(r => (decimal?)r.Amount) ?? 0m;
 
         var newLoans = await _context.Loans
@@ -109,17 +111,17 @@ public class ReportExportController : ControllerBase
         {
             var d    = firstDay.AddDays(i);
             var dStr = d.ToString("yyyy-MM-dd");
-            var dt   = txns.Where(t => t.Date.ToString("yyyy-MM-dd") == dStr).ToList();
+            var dt   = txns.Where(t => t.Date.ToString("yyyy-MM-dd") == dStr && IsPosted(t.ApprovalStatus)).ToList();
             return new DaySummary(
                 Date:          d,
                 Additions:     dt.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount),
                 Disbursements: dt.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount),
                 TxnCount:      dt.Count
             );
-        }).ToList();
+        }).Where(d => d.TxnCount > 0).ToList();
 
-        var totalAdds = txns.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
-        var totalDisb = txns.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var totalAdds = txns.Where(t => IsPosted(t.ApprovalStatus) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
+        var totalDisb = txns.Where(t => IsPosted(t.ApprovalStatus) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
 
         var monthName = firstDay.ToString("MMMM yyyy");
         var title     = $"Monthly Cash Report — {monthName}";
@@ -148,7 +150,7 @@ public class ReportExportController : ControllerBase
             .ToListAsync();
 
         var repayments = await _context.LoanRepayments
-            .Where(r => r.RepaymentDate >= weekStart && r.RepaymentDate < weekEnd)
+            .Where(r => r.RepaymentDate >= weekStart && r.RepaymentDate < weekEnd && r.ApprovalStatus == CashApprovalStatus.Approved)
             .SumAsync(r => (decimal?)r.Amount) ?? 0m;
         var newLoans = await _context.Loans
             .CountAsync(l => l.CreatedAt >= weekStart && l.CreatedAt < weekEnd);
@@ -157,17 +159,17 @@ public class ReportExportController : ControllerBase
         {
             var d    = weekStart.AddDays(i);
             var dStr = d.ToString("yyyy-MM-dd");
-            var dt   = txns.Where(t => t.Date.ToString("yyyy-MM-dd") == dStr).ToList();
+            var dt   = txns.Where(t => t.Date.ToString("yyyy-MM-dd") == dStr && IsPosted(t.ApprovalStatus)).ToList();
             return new DaySummary(
                 Date:          d,
                 Additions:     dt.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount),
                 Disbursements: dt.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount),
                 TxnCount:      dt.Count
             );
-        }).ToList();
+        }).Where(d => d.TxnCount > 0).ToList();
 
-        var totalAdds = txns.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
-        var totalDisb = txns.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var totalAdds = txns.Where(t => IsPosted(t.ApprovalStatus) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
+        var totalDisb = txns.Where(t => IsPosted(t.ApprovalStatus) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
 
         var label    = $"{weekStart:dd MMM} – {weekStart.AddDays(6):dd MMM yyyy}";
         var title    = $"Weekly Cash Report — {label}";
@@ -201,7 +203,7 @@ public class ReportExportController : ControllerBase
             .ToListAsync();
 
         var repayments = await _context.LoanRepayments
-            .Where(r => r.RepaymentDate >= start && r.RepaymentDate < end)
+            .Where(r => r.RepaymentDate >= start && r.RepaymentDate < end && r.ApprovalStatus == CashApprovalStatus.Approved)
             .SumAsync(r => (decimal?)r.Amount) ?? 0m;
         var newLoans = await _context.Loans
             .CountAsync(l => l.CreatedAt >= start && l.CreatedAt < end);
@@ -210,17 +212,17 @@ public class ReportExportController : ControllerBase
         {
             var d    = start.AddDays(i);
             var dStr = d.ToString("yyyy-MM-dd");
-            var dt   = txns.Where(x => x.Date.ToString("yyyy-MM-dd") == dStr).ToList();
+            var dt   = txns.Where(x => x.Date.ToString("yyyy-MM-dd") == dStr && IsPosted(x.ApprovalStatus)).ToList();
             return new DaySummary(
                 Date:          d,
                 Additions:     dt.Where(x => x.Type == TransactionType.Addition || x.Type == TransactionType.OpeningBalance).Sum(x => x.Amount),
                 Disbursements: dt.Where(x => x.Type == TransactionType.Disbursement).Sum(x => x.Amount),
                 TxnCount:      dt.Count
             );
-        }).ToList();
+        }).Where(d => d.TxnCount > 0).ToList();
 
-        var totalAdds = txns.Where(x => x.Type == TransactionType.Addition || x.Type == TransactionType.OpeningBalance).Sum(x => x.Amount);
-        var totalDisb = txns.Where(x => x.Type == TransactionType.Disbursement).Sum(x => x.Amount);
+        var totalAdds = txns.Where(x => IsPosted(x.ApprovalStatus) && (x.Type == TransactionType.Addition || x.Type == TransactionType.OpeningBalance)).Sum(x => x.Amount);
+        var totalDisb = txns.Where(x => IsPosted(x.ApprovalStatus) && x.Type == TransactionType.Disbursement).Sum(x => x.Amount);
 
         var label    = $"{start:dd MMM yyyy} – {end.AddDays(-1):dd MMM yyyy}";
         var title    = $"Cash Report — {label}";
@@ -250,7 +252,7 @@ public class ReportExportController : ControllerBase
             .ToListAsync();
 
         var repayments = await _context.LoanRepayments
-            .Where(r => r.RepaymentDate >= start && r.RepaymentDate < end)
+            .Where(r => r.RepaymentDate >= start && r.RepaymentDate < end && r.ApprovalStatus == CashApprovalStatus.Approved)
             .ToListAsync();
 
         var disbursed = await _context.Loans
@@ -282,7 +284,7 @@ public class ReportExportController : ControllerBase
             {
                 l.CreatedAt.ToString("dd MMM"),
                 l.ReferenceNumber, l.Borrower.FullName, l.Type.ToString(),
-                $"${l.Amount:N2}", $"!g${l.Repayments.Sum(r => r.Amount):N2}",
+                $"${l.Amount:N2}", $"!g${l.Repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Approved).Sum(r => r.Amount):N2}",
                 l.Status.ToString(), l.DueDate.ToString("dd MMM yyyy")
             }).ToList();
             var pms = ReportPdf.Build(title, summary, headers, rows, rightAlign: new[] { 4, 5 });
@@ -293,7 +295,7 @@ public class ReportExportController : ControllerBase
         {
             l.CreatedAt.ToString("dd MMM yyyy"),
             l.ReferenceNumber, l.Borrower.FullName, l.Type.ToString(),
-            l.Amount, l.Repayments.Sum(r => r.Amount),
+            l.Amount, l.Repayments.Where(r => r.ApprovalStatus == CashApprovalStatus.Approved).Sum(r => r.Amount),
             l.Status.ToString(), l.DueDate.ToString("dd MMM yyyy")
         }).ToList();
         var ms = ExcelTable.Build(title, summary, headers, xrows);
