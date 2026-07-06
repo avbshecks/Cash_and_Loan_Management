@@ -11,7 +11,7 @@ using CashLoanManagement.Infrastructure.Persistence;
 namespace CashLoanManagement.Api.Controllers;
 
 // Typed record — avoids dynamic/extension-method dispatch issues in QuestPDF lambdas
-internal record DaySummary(DateTime Date, decimal Additions, decimal Disbursements, int TxnCount);
+internal record DaySummary(DateTime Date, decimal Additions, decimal Disbursements, int TxnCount, string Narration = "");
 
 [Authorize]
 [Route("api/report")]
@@ -26,6 +26,16 @@ public class ReportExportController : ControllerBase
     }
 
     private static bool IsPosted(CashApprovalStatus s) => s == CashApprovalStatus.AutoApproved || s == CashApprovalStatus.Approved;
+
+    private static string BuildNarration(List<Domain.Entities.CashTransaction> dayTxns)
+    {
+        var parts = dayTxns
+            .OrderBy(t => t.Date)
+            .Select(t => $"{(t.Type == TransactionType.Disbursement ? "-" : "+")}${t.Amount:N0} {t.SourceOrPurpose}".Trim())
+            .Where(s => !string.IsNullOrWhiteSpace(s));
+        var narration = string.Join("; ", parts);
+        return narration.Length > 160 ? narration[..157] + "..." : narration;
+    }
 
     // ─── GET /api/report/daily-cash/export ───────────────────────────────────
     [HttpGet("daily-cash/export")]
@@ -116,7 +126,8 @@ public class ReportExportController : ControllerBase
                 Date:          d,
                 Additions:     dt.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount),
                 Disbursements: dt.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount),
-                TxnCount:      dt.Count
+                TxnCount:      dt.Count,
+                Narration:     BuildNarration(dt)
             );
         }).Where(d => d.TxnCount > 0).ToList();
 
@@ -164,7 +175,8 @@ public class ReportExportController : ControllerBase
                 Date:          d,
                 Additions:     dt.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount),
                 Disbursements: dt.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount),
-                TxnCount:      dt.Count
+                TxnCount:      dt.Count,
+                Narration:     BuildNarration(dt)
             );
         }).Where(d => d.TxnCount > 0).ToList();
 
@@ -217,7 +229,8 @@ public class ReportExportController : ControllerBase
                 Date:          d,
                 Additions:     dt.Where(x => x.Type == TransactionType.Addition || x.Type == TransactionType.OpeningBalance).Sum(x => x.Amount),
                 Disbursements: dt.Where(x => x.Type == TransactionType.Disbursement).Sum(x => x.Amount),
-                TxnCount:      dt.Count
+                TxnCount:      dt.Count,
+                Narration:     BuildNarration(dt)
             );
         }).Where(d => d.TxnCount > 0).ToList();
 
@@ -428,7 +441,7 @@ public class ReportExportController : ControllerBase
 
         // Day-by-day table
         row += 1;
-        var hdrs = new[] { "Date", "Day", "Cash In (USD)", "Cash Out (USD)", "Net (USD)", "Transactions" };
+        var hdrs = new[] { "Date", "Day", "Cash In (USD)", "Cash Out (USD)", "Net (USD)", "Transactions", "Narration" };
         for (int c = 0; c < hdrs.Length; c++)
         {
             ws.Cell(row, c + 1).Value = hdrs[c];
@@ -451,6 +464,8 @@ public class ReportExportController : ControllerBase
             ws.Cell(row, 5).Style.NumberFormat.Format = "$#,##0.00";
             ws.Cell(row, 5).Style.Font.FontColor = net >= 0 ? XLColor.DarkGreen : XLColor.Red;
             ws.Cell(row, 6).Value = d.TxnCount;
+            ws.Cell(row, 7).Value = d.Narration;
+            ws.Cell(row, 7).Style.Font.FontSize = 9;
             row++;
         }
 
@@ -468,7 +483,9 @@ public class ReportExportController : ControllerBase
         ws.Cell(row, 5).Style.Font.Bold = true;
         ws.Cell(row, 5).Style.Font.FontColor = (totalAdds - totalDisb) >= 0 ? XLColor.DarkGreen : XLColor.Red;
 
+        ws.Column(7).Width = 60;
         ws.Columns().AdjustToContents();
+        ws.Column(7).Width = 60;
 
         var ms = new MemoryStream();
         wb.SaveAs(ms);
@@ -661,11 +678,12 @@ public class ReportExportController : ControllerBase
                             c.RelativeColumn(2);
                             c.RelativeColumn(2);
                             c.ConstantColumn(40);
+                            c.RelativeColumn(6);
                         });
 
                         void Hdr(string t) => tbl.Cell().Background("#1e293b").Padding(5)
                             .Text(t).Bold().FontSize(8).FontColor("#ffffff");
-                        Hdr("Date"); Hdr("Day"); Hdr("Cash In"); Hdr("Cash Out"); Hdr("Net"); Hdr("Txns");
+                        Hdr("Date"); Hdr("Day"); Hdr("Cash In"); Hdr("Cash Out"); Hdr("Net"); Hdr("Txns"); Hdr("Narration");
 
                         bool alt = false;
                         foreach (var d in days)
@@ -682,6 +700,7 @@ public class ReportExportController : ControllerBase
                             var netCell = tbl.Cell().Background(bg).Padding(4).AlignRight().Text(hasData ? $"${net:N2}" : "—").FontSize(8).FontColor(!hasData ? "#cbd5e1" : net >= 0 ? "#16a34a" : "#dc2626");
                             if (hasData) netCell.Bold();
                             tbl.Cell().Background(bg).Padding(4).AlignCenter().Text(hasData ? d.TxnCount.ToString() : "—").FontSize(8).FontColor(hasData ? "#0f172a" : "#cbd5e1");
+                            tbl.Cell().Background(bg).Padding(4).Text(d.Narration).FontSize(7).FontColor("#475569");
                         }
 
                         // Totals
@@ -691,6 +710,7 @@ public class ReportExportController : ControllerBase
                         tbl.Cell().Background("#f1f5f9").Padding(4).AlignRight().Text($"${totalDisb:N2}").Bold().FontSize(8).FontColor("#dc2626");
                         var totalNet = totalAdds - totalDisb;
                         tbl.Cell().Background("#f1f5f9").Padding(4).AlignRight().Text($"${totalNet:N2}").Bold().FontSize(8).FontColor(totalNet >= 0 ? "#16a34a" : "#dc2626");
+                        tbl.Cell().Background("#f1f5f9").Padding(4).Text("").FontSize(8);
                         tbl.Cell().Background("#f1f5f9").Padding(4).Text("").FontSize(8);
                     });
                 });

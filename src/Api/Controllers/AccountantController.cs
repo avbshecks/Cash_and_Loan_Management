@@ -25,6 +25,8 @@ public class AccountantController : BaseApiController
     private readonly CashLoanDbContext _context;
     private readonly INotificationService _notificationService;
 
+    private static bool IsPosted(CashApprovalStatus s) => s == CashApprovalStatus.AutoApproved || s == CashApprovalStatus.Approved;
+
     public AccountantController(CashLoanDbContext context, INotificationService notificationService)
     {
         _context = context;
@@ -54,6 +56,8 @@ public class AccountantController : BaseApiController
             Amount = request.Amount, Type = TransactionType.OpeningBalance,
             SourceOrPurpose = string.IsNullOrWhiteSpace(request.SourceOrPurpose) ? "Initial Opening Balance" : request.SourceOrPurpose,
             Reference = $"ACC-OB-{DateTime.UtcNow:yyyyMMdd}",
+            ApprovalStatus = CashApprovalStatus.AutoApproved,
+            ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
             Date = DateTime.UtcNow, CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
         });
         await LogAuditAsync($"Accountant book initial balance set: ${request.Amount:N2}");
@@ -61,7 +65,7 @@ public class AccountantController : BaseApiController
         return Ok(new { message = "Accountant book opening balance recorded.", openingBalance = request.Amount });
     }
 
-    // ─── POST /api/accountant/add ─────────────────────────────────────────────
+    // ─── POST /api/accountant/add (MAKER → pending) ───────────────────────────
     [HttpPost("add")]
     [Authorize(Roles = "Admin,Accountant")]
     public async Task<IActionResult> AddCash([FromBody] AccountantMovementDto request)
@@ -74,23 +78,30 @@ public class AccountantController : BaseApiController
         {
             Amount = request.Amount, Type = TransactionType.Addition,
             SourceOrPurpose = request.SourceOrPurpose, Reference = reference,
+            ApprovalStatus = CashApprovalStatus.Pending,
             Date = DateTime.UtcNow, CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
         });
-        await LogAuditAsync($"Accountant book: cash in ${request.Amount:N2} — {request.SourceOrPurpose}. Ref: {reference}");
+        await LogAuditAsync($"Accountant book: cash in ${request.Amount:N2} — {request.SourceOrPurpose}. Ref: {reference}. AWAITING APPROVAL.");
         await _context.SaveChangesAsync();
-        return Ok(new { message = "Cash added to accountant book.", reference, newBalance = await ComputeBalanceAsync() });
+
+        await _notificationService.NotifyRoleAsync("Manager", "Accountant Book Cash In Pending Approval",
+            $"${request.Amount:N2} cash-in ({request.SourceOrPurpose}) needs approval.", NotificationType.PendingApproval);
+
+        return Ok(new { message = "Cash-in submitted for approval. It will reflect in the balance once a checker approves it.", reference, status = "PendingApproval" });
     }
 
-    // ─── POST /api/accountant/disburse ────────────────────────────────────────
+    // ─── POST /api/accountant/disburse (MAKER → pending) ──────────────────────
     [HttpPost("disburse")]
     [Authorize(Roles = "Admin,Accountant")]
     public async Task<IActionResult> Disburse([FromBody] AccountantMovementDto request)
     {
         if (request.Amount <= 0) return BadRequest(new { message = "Amount must be greater than zero." });
 
-        var balance = await ComputeBalanceAsync();
-        if (request.Amount > balance)
-            return BadRequest(new { message = $"Insufficient accountant book balance. Available: ${balance:N2}." });
+        var approved = await ComputeBalanceAsync();
+        var pending  = await PendingDisbursementsAsync();
+        var available = approved - pending;
+        if (request.Amount > available)
+            return BadRequest(new { message = $"Cannot request ${request.Amount:N2}. Available (after pending requests): ${available:N2}." });
 
         var userId    = GetCurrentUserId();
         var reference = await NextReferenceAsync("ACC-DISB", TransactionType.Disbursement);
@@ -98,11 +109,94 @@ public class AccountantController : BaseApiController
         {
             Amount = request.Amount, Type = TransactionType.Disbursement,
             SourceOrPurpose = request.SourceOrPurpose, Reference = reference,
+            ApprovalStatus = CashApprovalStatus.Pending,
             Date = DateTime.UtcNow, CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
         });
-        await LogAuditAsync($"Accountant book: cash out ${request.Amount:N2} — {request.SourceOrPurpose}. Ref: {reference}");
+        await LogAuditAsync($"Accountant book: cash out ${request.Amount:N2} — {request.SourceOrPurpose}. Ref: {reference}. AWAITING APPROVAL.");
         await _context.SaveChangesAsync();
-        return Ok(new { message = "Disbursement recorded in accountant book.", reference, newBalance = await ComputeBalanceAsync() });
+
+        await _notificationService.NotifyRoleAsync("Manager", "Accountant Book Cash Out Pending Approval",
+            $"${request.Amount:N2} cash-out ({request.SourceOrPurpose}) needs approval.", NotificationType.PendingApproval);
+
+        return Ok(new { message = "Cash-out submitted for approval. It will reflect in the balance once a checker approves it.", reference, status = "PendingApproval" });
+    }
+
+    // ─── GET /api/accountant/pending (CHECKER) ────────────────────────────────
+    [HttpGet("pending")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> GetPendingMovements()
+    {
+        var pending = await _context.AccountantTransactions
+            .Include(t => t.CreatedByUser)
+            .Where(t => t.ApprovalStatus == CashApprovalStatus.Pending)
+            .OrderBy(t => t.Date)
+            .Select(t => new
+            {
+                t.Id, t.Date, t.Amount, type = t.Type.ToString(),
+                t.SourceOrPurpose, t.Reference,
+                requestedBy = t.CreatedByUser.FullName
+            })
+            .ToListAsync();
+        return Ok(pending);
+    }
+
+    // ─── POST /api/accountant/approve/{id} (CHECKER) ──────────────────────────
+    [HttpPost("approve/{id:int}")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> ApproveMovement(int id)
+    {
+        var txn = await _context.AccountantTransactions.FirstOrDefaultAsync(t => t.Id == id);
+        if (txn == null) return NotFound(new { message = "Transaction not found." });
+        if (txn.ApprovalStatus != CashApprovalStatus.Pending)
+            return BadRequest(new { message = $"Transaction is not pending. Status: {txn.ApprovalStatus}." });
+
+        if (txn.Type == TransactionType.Disbursement)
+        {
+            var available = await ComputeBalanceAsync();
+            if (txn.Amount > available)
+                return BadRequest(new { message = $"Insufficient accountant book balance to approve. Available: ${available:N2}, required ${txn.Amount:N2}." });
+        }
+
+        var userId = GetCurrentUserId();
+        txn.ApprovalStatus = CashApprovalStatus.Approved;
+        txn.ApprovedByUserId = userId;
+        txn.ApprovedAt = DateTime.UtcNow;
+        txn.UpdatedAt = DateTime.UtcNow;
+
+        var action = txn.Type == TransactionType.Addition ? "cash-in" : "cash-out";
+        await LogAuditAsync($"Accountant book: {action} ${txn.Amount:N2} APPROVED. Ref: {txn.Reference}");
+        await _context.SaveChangesAsync();
+
+        await _notificationService.NotifyUserAsync(txn.CreatedByUserId, "Accountant Book Entry Approved",
+            $"Your {action} of ${txn.Amount:N2} ({txn.SourceOrPurpose}) has been approved.", NotificationType.PendingApproval);
+
+        return Ok(new { message = $"{char.ToUpper(action[0])}{action[1..]} approved.", newBalance = await ComputeBalanceAsync() });
+    }
+
+    // ─── POST /api/accountant/reject/{id} (CHECKER) ───────────────────────────
+    [HttpPost("reject/{id:int}")]
+    [Authorize(Roles = "Admin,Manager")]
+    public async Task<IActionResult> RejectMovement(int id, [FromBody] string reason)
+    {
+        var txn = await _context.AccountantTransactions.FirstOrDefaultAsync(t => t.Id == id);
+        if (txn == null) return NotFound(new { message = "Transaction not found." });
+        if (txn.ApprovalStatus != CashApprovalStatus.Pending)
+            return BadRequest(new { message = "Transaction is not pending." });
+
+        var userId = GetCurrentUserId();
+        txn.ApprovalStatus = CashApprovalStatus.Rejected;
+        txn.RejectionReason = reason;
+        txn.ApprovedByUserId = userId;
+        txn.UpdatedAt = DateTime.UtcNow;
+
+        var action = txn.Type == TransactionType.Addition ? "cash-in" : "cash-out";
+        await LogAuditAsync($"Accountant book: {action} ${txn.Amount:N2} REJECTED. Reason: {reason}");
+        await _context.SaveChangesAsync();
+
+        await _notificationService.NotifyUserAsync(txn.CreatedByUserId, "Accountant Book Entry Rejected",
+            $"Your {action} of ${txn.Amount:N2} ({txn.SourceOrPurpose}) was rejected. Reason: {reason}", NotificationType.PendingApproval);
+
+        return Ok(new { message = $"{char.ToUpper(action[0])}{action[1..]} rejected.", reason });
     }
 
     // ─── GET /api/accountant/transactions ─────────────────────────────────────
@@ -118,6 +212,7 @@ public class AccountantController : BaseApiController
             {
                 t.Id, t.Date, t.Amount, type = t.Type.ToString(),
                 t.SourceOrPurpose, t.Reference, createdBy = t.CreatedByUser.FullName,
+                approvalStatus = t.ApprovalStatus.ToString(),
                 t.IsReversed,
                 isReversal = t.ReversalOfTransactionId != null,
                 reversalStatus = t.ReversalStatus != null ? t.ReversalStatus.ToString() : null
@@ -136,6 +231,8 @@ public class AccountantController : BaseApiController
 
         var original = await _context.AccountantTransactions.FirstOrDefaultAsync(t => t.Id == id);
         if (original == null) return NotFound(new { message = "Transaction not found." });
+        if (!IsPosted(original.ApprovalStatus))
+            return BadRequest(new { message = "Only posted (approved) transactions can be reversed. This entry is still pending or was rejected." });
         if (original.ReversalOfTransactionId != null)
             return BadRequest(new { message = "You cannot reverse a reversal entry." });
         if (original.IsReversed)
@@ -199,6 +296,8 @@ public class AccountantController : BaseApiController
             Reference       = $"REV-{original.Reference}",
             Date            = DateTime.UtcNow,
             ReversalOfTransactionId = original.Id,
+            ApprovalStatus  = CashApprovalStatus.AutoApproved,
+            ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
             CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
         });
 
@@ -254,8 +353,8 @@ public class AccountantController : BaseApiController
         var (dayStart, dayEnd, _, _) = ResolveRange(period, date, from, to);
         var txns = await DayTransactionsAsync(dayStart, dayEnd);
         var opening = await BalanceBeforeAsync(dayStart);
-        var added     = txns.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
-        var disbursed = txns.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var added     = txns.Where(t => IsPosted(t.ApprovalStatus) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
+        var disbursed = txns.Where(t => IsPosted(t.ApprovalStatus) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
 
         return Ok(new
         {
@@ -266,6 +365,7 @@ public class AccountantController : BaseApiController
             {
                 t.Id, t.Date, t.Amount, type = t.Type.ToString(),
                 t.SourceOrPurpose, t.Reference, createdBy = t.CreatedByUser.FullName,
+                approvalStatus = t.ApprovalStatus.ToString(),
                 t.IsReversed,
                 isReversal = t.ReversalOfTransactionId != null,
                 reversalStatus = t.ReversalStatus != null ? t.ReversalStatus.ToString() : null
@@ -285,9 +385,12 @@ public class AccountantController : BaseApiController
         var (dayStart, dayEnd, label, slug) = ResolveRange(period, date, from, to);
         var txns = await DayTransactionsAsync(dayStart, dayEnd);
         var opening   = await BalanceBeforeAsync(dayStart);
-        var added     = txns.Where(t => t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance).Sum(t => t.Amount);
-        var disbursed = txns.Where(t => t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
+        var added     = txns.Where(t => IsPosted(t.ApprovalStatus) && (t.Type == TransactionType.Addition || t.Type == TransactionType.OpeningBalance)).Sum(t => t.Amount);
+        var disbursed = txns.Where(t => IsPosted(t.ApprovalStatus) && t.Type == TransactionType.Disbursement).Sum(t => t.Amount);
         var closing   = opening + added - disbursed;
+
+        // Exclude pending/rejected entries from the posted DR/CR ledger export
+        txns = txns.Where(t => IsPosted(t.ApprovalStatus)).ToList();
 
         var periodName = from != null && to != null ? "Range" : char.ToUpper(period[0]) + period[1..].ToLower();
         var title    = $"Accountant Cash Report — {label}";
@@ -351,10 +454,12 @@ public class AccountantController : BaseApiController
     private async Task<decimal> ComputeBalanceAsync()
     {
         var credits = await _context.AccountantTransactions
-            .Where(t => t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition)
+            .Where(t => (t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition) &&
+                        (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
         var debits = await _context.AccountantTransactions
-            .Where(t => t.Type == TransactionType.Disbursement)
+            .Where(t => t.Type == TransactionType.Disbursement &&
+                        (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
         return credits - debits;
     }
@@ -362,12 +467,21 @@ public class AccountantController : BaseApiController
     private async Task<decimal> BalanceBeforeAsync(DateTime beforeUtc)
     {
         var credits = await _context.AccountantTransactions
-            .Where(t => (t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition) && t.Date < beforeUtc)
+            .Where(t => (t.Type == TransactionType.OpeningBalance || t.Type == TransactionType.Addition) && t.Date < beforeUtc &&
+                        (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
         var debits = await _context.AccountantTransactions
-            .Where(t => t.Type == TransactionType.Disbursement && t.Date < beforeUtc)
+            .Where(t => t.Type == TransactionType.Disbursement && t.Date < beforeUtc &&
+                        (t.ApprovalStatus == CashApprovalStatus.AutoApproved || t.ApprovalStatus == CashApprovalStatus.Approved))
             .SumAsync(t => (decimal?)t.Amount) ?? 0m;
         return credits - debits;
+    }
+
+    private async Task<decimal> PendingDisbursementsAsync()
+    {
+        return await _context.AccountantTransactions
+            .Where(t => t.Type == TransactionType.Disbursement && t.ApprovalStatus == CashApprovalStatus.Pending)
+            .SumAsync(t => (decimal?)t.Amount) ?? 0m;
     }
 
     private async Task<string> NextReferenceAsync(string prefix, TransactionType type)

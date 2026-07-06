@@ -15,6 +15,13 @@ public class AccountantTransaction : BaseEntity
     public string Reference { get; set; } = string.Empty;
     public DateTime Date { get; set; } = DateTime.UtcNow;
 
+    // Maker-Checker: additions/disbursements start Pending; opening balance is AutoApproved.
+    public CashApprovalStatus ApprovalStatus { get; set; } = CashApprovalStatus.Pending;
+    public string? RejectionReason { get; set; }
+    public DateTime? ApprovedAt { get; set; }
+    public int? ApprovedByUserId { get; set; }
+    public User? ApprovedByUser { get; set; }
+
     // Reversal (corrections): maker-checker. Accountant/Admin requests, Manager/Admin approves.
     public bool IsReversed { get; set; }
     public int? ReversalOfTransactionId { get; set; }
