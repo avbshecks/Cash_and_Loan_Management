@@ -338,6 +338,8 @@ public class LoanController : BaseApiController
         if (loan == null) return NotFound(new { message = "Loan not found." });
         if (loan.Status != LoanStatus.Pending)
             return BadRequest(new { message = $"Loan must be Pending to approve. Current: {loan.Status}." });
+        if (loan.CreatedByUserId == GetCurrentUserId())
+            return BadRequest(new { message = "You cannot approve your own loan request." });
 
         var userId = GetCurrentUserId();
         loan.Status           = LoanStatus.Approved;  // ← Now Approved, not yet Active
@@ -373,6 +375,8 @@ public class LoanController : BaseApiController
         if (loan == null) return NotFound(new { message = "Loan not found." });
         if (loan.Status != LoanStatus.Approved)
             return BadRequest(new { message = $"Loan must be Approved before disbursement. Current: {loan.Status}." });
+        if (loan.CreatedByUserId == GetCurrentUserId())
+            return BadRequest(new { message = "You cannot disburse a loan you created." });
 
         var balance = await _cashHelper.ComputeBalanceAsync();
         if (loan.Amount > balance)
@@ -530,6 +534,8 @@ public class LoanController : BaseApiController
         if (repayment == null) return NotFound(new { message = "Repayment not found." });
         if (repayment.ApprovalStatus != CashApprovalStatus.Pending)
             return BadRequest(new { message = $"Repayment is not pending. Status: {repayment.ApprovalStatus}." });
+        if (repayment.CapturedByUserId == GetCurrentUserId())
+            return BadRequest(new { message = "You cannot approve your own repayment request." });
 
         var userId = GetCurrentUserId();
         var loan = repayment.Loan;
@@ -581,6 +587,9 @@ public class LoanController : BaseApiController
     [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> RejectRepayment(int id, [FromBody] string reason)
     {
+        if (string.IsNullOrWhiteSpace(reason))
+            return BadRequest(new { message = "A reason for rejection is required." });
+
         var repayment = await _context.LoanRepayments
             .Include(r => r.Loan).ThenInclude(l => l.Borrower)
             .FirstOrDefaultAsync(r => r.Id == id);

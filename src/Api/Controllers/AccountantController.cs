@@ -149,6 +149,8 @@ public class AccountantController : BaseApiController
         if (txn == null) return NotFound(new { message = "Transaction not found." });
         if (txn.ApprovalStatus != CashApprovalStatus.Pending)
             return BadRequest(new { message = $"Transaction is not pending. Status: {txn.ApprovalStatus}." });
+        if (txn.CreatedByUserId == GetCurrentUserId())
+            return BadRequest(new { message = "You cannot approve your own request." });
 
         if (txn.Type == TransactionType.Disbursement)
         {
@@ -178,6 +180,9 @@ public class AccountantController : BaseApiController
     [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> RejectMovement(int id, [FromBody] string reason)
     {
+        if (string.IsNullOrWhiteSpace(reason))
+            return BadRequest(new { message = "A reason for rejection is required." });
+
         var txn = await _context.AccountantTransactions.FirstOrDefaultAsync(t => t.Id == id);
         if (txn == null) return NotFound(new { message = "Transaction not found." });
         if (txn.ApprovalStatus != CashApprovalStatus.Pending)
@@ -286,6 +291,8 @@ public class AccountantController : BaseApiController
         if (original == null) return NotFound(new { message = "Transaction not found." });
         if (original.ReversalStatus != CashApprovalStatus.Pending)
             return BadRequest(new { message = "No pending reversal request for this transaction." });
+        if (original.ReversalRequestedByUserId == GetCurrentUserId())
+            return BadRequest(new { message = "You cannot approve your own reversal request." });
 
         var userId = GetCurrentUserId();
         _context.AccountantTransactions.Add(new AccountantTransaction
@@ -296,7 +303,7 @@ public class AccountantController : BaseApiController
             Reference       = $"REV-{original.Reference}",
             Date            = DateTime.UtcNow,
             ReversalOfTransactionId = original.Id,
-            ApprovalStatus  = CashApprovalStatus.AutoApproved,
+            ApprovalStatus  = CashApprovalStatus.Approved,
             ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
             CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
         });
@@ -322,6 +329,9 @@ public class AccountantController : BaseApiController
     [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> RejectReversal(int id, [FromBody] string reason)
     {
+        if (string.IsNullOrWhiteSpace(reason))
+            return BadRequest(new { message = "A reason for rejection is required." });
+
         var original = await _context.AccountantTransactions.FirstOrDefaultAsync(t => t.Id == id);
         if (original == null) return NotFound(new { message = "Transaction not found." });
         if (original.ReversalStatus != CashApprovalStatus.Pending)

@@ -165,6 +165,8 @@ public class CashController : BaseApiController
             return BadRequest(new { message = "Only additions and disbursements require approval." });
         if (tx.ApprovalStatus != CashApprovalStatus.Pending)
             return BadRequest(new { message = $"Transaction is not pending. Status: {tx.ApprovalStatus}." });
+        if (tx.CreatedByUserId == GetCurrentUserId())
+            return BadRequest(new { message = "You cannot approve your own request." });
 
         // Re-check balance for disbursements only (another one may have reduced it since the request was made)
         if (tx.Type == TransactionType.Disbursement)
@@ -201,6 +203,9 @@ public class CashController : BaseApiController
     [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> RejectDisbursement(int id, [FromBody] string reason)
     {
+        if (string.IsNullOrWhiteSpace(reason))
+            return BadRequest(new { message = "A reason for rejection is required." });
+
         var tx = await _context.CashTransactions
             .FirstOrDefaultAsync(t => t.Id == id);
 
@@ -351,6 +356,8 @@ public class CashController : BaseApiController
         if (original == null) return NotFound(new { message = "Transaction not found." });
         if (original.ReversalStatus != CashApprovalStatus.Pending)
             return BadRequest(new { message = "No pending reversal request for this transaction." });
+        if (original.ReversalRequestedByUserId == GetCurrentUserId())
+            return BadRequest(new { message = "You cannot approve your own reversal request." });
 
         var userId = GetCurrentUserId();
 
@@ -395,6 +402,9 @@ public class CashController : BaseApiController
     [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> RejectReversal(int id, [FromBody] string reason)
     {
+        if (string.IsNullOrWhiteSpace(reason))
+            return BadRequest(new { message = "A reason for rejection is required." });
+
         var original = await _context.CashTransactions.FirstOrDefaultAsync(t => t.Id == id);
         if (original == null) return NotFound(new { message = "Transaction not found." });
         if (original.ReversalStatus != CashApprovalStatus.Pending)

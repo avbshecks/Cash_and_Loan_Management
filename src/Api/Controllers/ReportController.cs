@@ -16,8 +16,6 @@ public class ReportController : BaseApiController
         _context = context;
     }
 
-    private static bool IsPosted(CashApprovalStatus s) => s == CashApprovalStatus.AutoApproved || s == CashApprovalStatus.Approved;
-
     // ─── GET /api/report/daily-cash ──────────────────────────────────────────
     [HttpGet("daily-cash")]
     public async Task<IActionResult> GetDailyCashSummary([FromQuery] string? date)

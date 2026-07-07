@@ -25,8 +25,6 @@ public class ReportExportController : ControllerBase
         _context = context;
     }
 
-    private static bool IsPosted(CashApprovalStatus s) => s == CashApprovalStatus.AutoApproved || s == CashApprovalStatus.Approved;
-
     private static string BuildNarration(List<Domain.Entities.CashTransaction> dayTxns)
     {
         var parts = dayTxns

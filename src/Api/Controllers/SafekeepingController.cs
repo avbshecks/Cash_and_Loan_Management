@@ -222,6 +222,8 @@ public class SafekeepingController : BaseApiController
         if (txn == null) return NotFound(new { message = "Transaction not found." });
         if (txn.ApprovalStatus != CashApprovalStatus.Pending)
             return BadRequest(new { message = $"Transaction is not pending. Status: {txn.ApprovalStatus}." });
+        if (txn.CreatedByUserId == GetCurrentUserId())
+            return BadRequest(new { message = "You cannot approve your own request." });
 
         // Re-check funds for withdrawals only (other approvals may have reduced the balance)
         if (txn.Type == SafekeepingTransactionType.Withdrawal)
@@ -252,6 +254,9 @@ public class SafekeepingController : BaseApiController
     [Authorize(Roles = "Admin,Manager")]
     public async Task<IActionResult> RejectWithdrawal(int id, [FromBody] string reason)
     {
+        if (string.IsNullOrWhiteSpace(reason))
+            return BadRequest(new { message = "A reason for rejection is required." });
+
         var txn = await _context.SafekeepingTransactions.Include(t => t.Account).FirstOrDefaultAsync(t => t.Id == id);
         if (txn == null) return NotFound(new { message = "Transaction not found." });
         if (txn.ApprovalStatus != CashApprovalStatus.Pending)
