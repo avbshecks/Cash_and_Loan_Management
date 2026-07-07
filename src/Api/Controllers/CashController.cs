@@ -168,23 +168,42 @@ public class CashController : BaseApiController
         if (tx.CreatedByUserId == GetCurrentUserId())
             return BadRequest(new { message = "You cannot approve your own request." });
 
-        // Re-check balance for disbursements only (another one may have reduced it since the request was made)
+        var userId = GetCurrentUserId();
+        var action = tx.Type == TransactionType.Addition ? "addition" : "disbursement";
+
+        // Disbursements risk overdraft if two are approved at the same instant — serialize
+        // the balance check + write behind an advisory lock so the second approver always
+        // re-checks against the first approver's already-committed balance.
         if (tx.Type == TransactionType.Disbursement)
         {
-            var currentBalance = await ComputeBalanceAsync();
-            if (tx.Amount > currentBalance)
+            var approved = await AdvisoryLock.WithLockAsync(_context, AdvisoryLock.MainCashBook, async () =>
+            {
+                var currentBalance = await ComputeBalanceAsync();
+                if (tx.Amount > currentBalance) return false;
+
+                tx.ApprovalStatus  = CashApprovalStatus.Approved;
+                tx.ApprovedByUserId = userId;
+                tx.ApprovedAt       = DateTime.UtcNow;
+                tx.UpdatedAt        = DateTime.UtcNow;
+                await _context.SaveChangesAsync();
+                return true;
+            });
+            if (!approved)
+            {
+                var currentBalance = await ComputeBalanceAsync();
                 return BadRequest(new { message = $"Insufficient balance to approve. Current: ${currentBalance:N2}, Required: ${tx.Amount:N2}." });
+            }
+        }
+        else
+        {
+            tx.ApprovalStatus  = CashApprovalStatus.Approved;
+            tx.ApprovedByUserId = userId;
+            tx.ApprovedAt       = DateTime.UtcNow;
+            tx.UpdatedAt        = DateTime.UtcNow;
+            await _context.SaveChangesAsync();
         }
 
-        var userId = GetCurrentUserId();
-        tx.ApprovalStatus  = CashApprovalStatus.Approved;
-        tx.ApprovedByUserId = userId;
-        tx.ApprovedAt       = DateTime.UtcNow;
-        tx.UpdatedAt        = DateTime.UtcNow;
-
-        var action = tx.Type == TransactionType.Addition ? "addition" : "disbursement";
         await LogAuditAsync(userId, $"Cash {action} APPROVED: ${tx.Amount:N2} — '{tx.SourceOrPurpose}'. Ref: {tx.Reference}");
-        await _context.SaveChangesAsync();
 
         var newBalance = await ComputeBalanceAsync();
 

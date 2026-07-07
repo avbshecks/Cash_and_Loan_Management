@@ -222,3 +222,6 @@ finally
 {
     Log.CloseAndFlush();
 }
+
+/// <summary>Exposes the top-level Program class to WebApplicationFactory&lt;Program&gt; for integration tests.</summary>
+public partial class Program { }

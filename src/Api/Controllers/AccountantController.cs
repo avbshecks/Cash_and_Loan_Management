@@ -152,22 +152,39 @@ public class AccountantController : BaseApiController
         if (txn.CreatedByUserId == GetCurrentUserId())
             return BadRequest(new { message = "You cannot approve your own request." });
 
+        var userId = GetCurrentUserId();
+        var action = txn.Type == TransactionType.Addition ? "cash-in" : "cash-out";
+
         if (txn.Type == TransactionType.Disbursement)
         {
-            var available = await ComputeBalanceAsync();
-            if (txn.Amount > available)
+            var approvedOk = await AdvisoryLock.WithLockAsync(_context, AdvisoryLock.AccountantBook, async () =>
+            {
+                var available = await ComputeBalanceAsync();
+                if (txn.Amount > available) return false;
+
+                txn.ApprovalStatus = CashApprovalStatus.Approved;
+                txn.ApprovedByUserId = userId;
+                txn.ApprovedAt = DateTime.UtcNow;
+                txn.UpdatedAt = DateTime.UtcNow;
+                await _context.SaveChangesAsync();
+                return true;
+            });
+            if (!approvedOk)
+            {
+                var available = await ComputeBalanceAsync();
                 return BadRequest(new { message = $"Insufficient accountant book balance to approve. Available: ${available:N2}, required ${txn.Amount:N2}." });
+            }
+        }
+        else
+        {
+            txn.ApprovalStatus = CashApprovalStatus.Approved;
+            txn.ApprovedByUserId = userId;
+            txn.ApprovedAt = DateTime.UtcNow;
+            txn.UpdatedAt = DateTime.UtcNow;
+            await _context.SaveChangesAsync();
         }
 
-        var userId = GetCurrentUserId();
-        txn.ApprovalStatus = CashApprovalStatus.Approved;
-        txn.ApprovedByUserId = userId;
-        txn.ApprovedAt = DateTime.UtcNow;
-        txn.UpdatedAt = DateTime.UtcNow;
-
-        var action = txn.Type == TransactionType.Addition ? "cash-in" : "cash-out";
         await LogAuditAsync($"Accountant book: {action} ${txn.Amount:N2} APPROVED. Ref: {txn.Reference}");
-        await _context.SaveChangesAsync();
 
         await _notificationService.NotifyUserAsync(txn.CreatedByUserId, "Accountant Book Entry Approved",
             $"Your {action} of ${txn.Amount:N2} ({txn.SourceOrPurpose}) has been approved.", NotificationType.PendingApproval);

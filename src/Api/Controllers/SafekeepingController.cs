@@ -225,23 +225,42 @@ public class SafekeepingController : BaseApiController
         if (txn.CreatedByUserId == GetCurrentUserId())
             return BadRequest(new { message = "You cannot approve your own request." });
 
-        // Re-check funds for withdrawals only (other approvals may have reduced the balance)
+        var userId = GetCurrentUserId();
+        var action = txn.Type == SafekeepingTransactionType.Deposit ? "deposit" : "withdrawal";
+
+        // Withdrawals risk overdraft if two are approved on the same account at once — serialize
+        // the balance check + write per account so the second approver re-checks against the
+        // first approver's already-committed balance.
         if (txn.Type == SafekeepingTransactionType.Withdrawal)
         {
-            var approved = await ApprovedBalanceAsync(txn.AccountId);
-            if (txn.Amount > approved)
-                return BadRequest(new { message = $"Insufficient balance to approve. Available ${approved:N2}, required ${txn.Amount:N2}." });
+            var approvedOk = await AdvisoryLock.WithLockAsync(_context, AdvisoryLock.SafekeepingBookBase + txn.AccountId, async () =>
+            {
+                var available = await ApprovedBalanceAsync(txn.AccountId);
+                if (txn.Amount > available) return false;
+
+                txn.ApprovalStatus = CashApprovalStatus.Approved;
+                txn.ApprovedByUserId = userId;
+                txn.ApprovedAt = DateTime.UtcNow;
+                txn.UpdatedAt = DateTime.UtcNow;
+                await _context.SaveChangesAsync();
+                return true;
+            });
+            if (!approvedOk)
+            {
+                var available = await ApprovedBalanceAsync(txn.AccountId);
+                return BadRequest(new { message = $"Insufficient balance to approve. Available ${available:N2}, required ${txn.Amount:N2}." });
+            }
+        }
+        else
+        {
+            txn.ApprovalStatus = CashApprovalStatus.Approved;
+            txn.ApprovedByUserId = userId;
+            txn.ApprovedAt = DateTime.UtcNow;
+            txn.UpdatedAt = DateTime.UtcNow;
+            await _context.SaveChangesAsync();
         }
 
-        var userId = GetCurrentUserId();
-        txn.ApprovalStatus = CashApprovalStatus.Approved;
-        txn.ApprovedByUserId = userId;
-        txn.ApprovedAt = DateTime.UtcNow;
-        txn.UpdatedAt = DateTime.UtcNow;
-
-        var action = txn.Type == SafekeepingTransactionType.Deposit ? "deposit" : "withdrawal";
         await LogAuditAsync($"Safekeeping {action} APPROVED ${txn.Amount:N2} for '{txn.Account.DepositorName}'. Ref: {txn.Reference}");
-        await _context.SaveChangesAsync();
 
         await _notificationService.NotifyUserAsync(txn.CreatedByUserId, $"Safekeeping {char.ToUpper(action[0])}{action[1..]} Approved",
             $"The {action} of ${txn.Amount:N2} for {txn.Account.DepositorName} has been approved.", NotificationType.PendingApproval);

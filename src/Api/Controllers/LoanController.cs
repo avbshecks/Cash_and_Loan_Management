@@ -214,8 +214,9 @@ public class LoanController : BaseApiController
 
     // ─── DAY LOAN: borrow in the morning, repay in the evening ────────────────
     /// <summary>
-    /// Creates a same-day loan that is immediately active and disbursed (one step),
-    /// due by end of today. Repaid in the evening via the normal repayment flow.
+    /// Requests a same-day loan, due by end of today. Like a regular loan, this goes through
+    /// the standard two-step maker-checker (approve, then disburse) — a Manager/Admin who is
+    /// not the requester must approve and disburse it before cash actually moves.
     /// </summary>
     [HttpPost("day-loan")]
     [Authorize(Roles = "Admin,Cashier")]
@@ -248,33 +249,24 @@ public class LoanController : BaseApiController
         {
             ReferenceNumber = reference, BorrowerId = request.BorrowerId,
             Amount = request.Amount, Type = LoanType.DayLoan,
-            RepaymentTerms = "Same-day — borrow in the morning, repay by evening.",
-            DueDate = dueToday, Status = LoanStatus.Active,
-            CreatedByUserId = userId, ApprovedByUserId = userId,
-            ApprovedAt = DateTime.UtcNow, DisbursedAt = DateTime.UtcNow,
-            CreatedAt = DateTime.UtcNow
+            RepaymentTerms = "Same-day — borrow in the morning, repay by evening."
+                + (request.Notes != null ? $" Notes: {request.Notes}" : ""),
+            DueDate = dueToday, Status = LoanStatus.Pending,
+            CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
         };
         _context.Loans.Add(loan);
 
-        // Immediate cash disbursement (approved)
-        _context.CashTransactions.Add(new CashTransaction
-        {
-            Amount = request.Amount, Type = TransactionType.Disbursement,
-            SourceOrPurpose = $"Day loan — {borrower.FullName} ({reference})" + (request.Notes != null ? $" — {request.Notes}" : ""),
-            Reference = reference, Date = DateTime.UtcNow,
-            ApprovalStatus = CashApprovalStatus.Approved,
-            ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
-            CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
-        });
-
-        await LogAuditAsync(userId, $"Day loan issued: {reference} ${request.Amount:N2} to {borrower.FullName}. Due today.");
+        await LogAuditAsync(userId, $"Day loan requested: {reference} ${request.Amount:N2} for {borrower.FullName}. Due today. AWAITING APPROVAL.");
         await _context.SaveChangesAsync();
+
+        await _notificationService.NotifyRoleAsync("Manager", "Day Loan Pending Approval",
+            $"Day loan {reference} for {borrower.FullName} (${request.Amount:N2}, due today) awaiting approval.", NotificationType.PendingApproval);
 
         return Ok(new
         {
-            message = $"Day loan {reference} issued and disbursed. Due by end of today.",
+            message = $"Day loan {reference} submitted for approval. Approve and disburse it to hand over the cash.",
             loanId = loan.Id, referenceNumber = reference,
-            dueDate = dueToday, newCashBalance = await _cashHelper.ComputeBalanceAsync()
+            dueDate = dueToday, status = "PendingApproval"
         });
     }
 
@@ -378,30 +370,42 @@ public class LoanController : BaseApiController
         if (loan.CreatedByUserId == GetCurrentUserId())
             return BadRequest(new { message = "You cannot disburse a loan you created." });
 
-        var balance = await _cashHelper.ComputeBalanceAsync();
-        if (loan.Amount > balance)
-            return BadRequest(new { message = $"Insufficient cash balance. Available: ${balance:N2}, Required: ${loan.Amount:N2}." });
-
         var userId = GetCurrentUserId();
 
-        // Create auto-approved cash disbursement (loan disbursement is already checker-approved via loan approval)
-        var tx = new CashTransaction
+        // Disbursement draws down the shared cash balance — serialize against any other
+        // concurrent disbursement/approval so two Managers can't jointly overdraw it.
+        var disbursed = await AdvisoryLock.WithLockAsync(_context, AdvisoryLock.MainCashBook, async () =>
         {
-            Amount = loan.Amount, Type = TransactionType.Disbursement,
-            SourceOrPurpose = $"Loan disbursement — {loan.Borrower.FullName} ({loan.ReferenceNumber})",
-            Reference = loan.ReferenceNumber, Date = DateTime.UtcNow,
-            ApprovalStatus = CashApprovalStatus.Approved,
-            ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
-            CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
-        };
-        _context.CashTransactions.Add(tx);
+            var balance = await _cashHelper.ComputeBalanceAsync();
+            if (loan.Amount > balance) return false;
 
-        loan.Status      = LoanStatus.Active;
-        loan.DisbursedAt = DateTime.UtcNow;
-        loan.UpdatedAt   = DateTime.UtcNow;
+            // Create auto-approved cash disbursement (loan disbursement is already checker-approved via loan approval)
+            var tx = new CashTransaction
+            {
+                Amount = loan.Amount, Type = TransactionType.Disbursement,
+                SourceOrPurpose = $"Loan disbursement — {loan.Borrower.FullName} ({loan.ReferenceNumber})",
+                Reference = loan.ReferenceNumber, Date = DateTime.UtcNow,
+                ApprovalStatus = CashApprovalStatus.Approved,
+                ApprovedByUserId = userId, ApprovedAt = DateTime.UtcNow,
+                CreatedByUserId = userId, CreatedAt = DateTime.UtcNow
+            };
+            _context.CashTransactions.Add(tx);
+
+            loan.Status      = LoanStatus.Active;
+            loan.DisbursedAt = DateTime.UtcNow;
+            loan.UpdatedAt   = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+            return true;
+        });
+
+        if (!disbursed)
+        {
+            var balance = await _cashHelper.ComputeBalanceAsync();
+            return BadRequest(new { message = $"Insufficient cash balance. Available: ${balance:N2}, Required: ${loan.Amount:N2}." });
+        }
 
         await LogAuditAsync(userId, $"Loan {loan.ReferenceNumber} DISBURSED. ${loan.Amount:N2} deducted from cash. Borrower: {loan.Borrower.FullName}");
-        await _context.SaveChangesAsync();
 
         var newBalance = await _cashHelper.ComputeBalanceAsync();
 
